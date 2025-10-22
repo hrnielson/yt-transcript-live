@@ -14,8 +14,11 @@ import streamlit as st
 import yt_dlp
 from openai import OpenAI
 from supabase import Client, create_client
-from youtube_transcript_api import (NoTranscriptFound, TranscriptsDisabled,
-                                    YouTubeTranscriptApi)
+from youtube_transcript_api import (NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi)
+
+import yt_dlp
+st.sidebar.caption(f"yt-dlp version: {yt_dlp.version.__version__}")
+
 
 # ---------- Secrets / Clients ----------
 # These must be configured in Streamlit secrets.
