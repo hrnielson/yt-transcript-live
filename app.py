@@ -6,6 +6,8 @@ import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from supabase import create_client, Client
 from openai import OpenAI
+from pathlib import Path
+import tempfile
 
 # ------------- Config from Streamlit secrets -------------
 SB_URL = st.secrets["SUPABASE_URL"]
@@ -132,28 +134,67 @@ def fetch_youtube_captions(video_id: str, preferred=("da","en","no","sv")):
         return None
 
 # -------- Download audio (no ffmpeg needed: take bestaudio as-is) --------
-def download_audio_tmp(video_id: str) -> Path:
-    tmpdir = Path(tempfile.mkdtemp())
-    outtmpl = str(tmpdir / f"{video_id}.%(ext)s")
+def write_cookies_if_any(cookies_text: str) -> str | None:
+    if not cookies_text or "# Netscape" not in cookies_text:
+        return None
+    tmp = Path(tempfile.mkdtemp()) / "cookies.txt"
+    tmp.write_text(cookies_text, encoding="utf-8")
+    return str(tmp)
+
+def try_download(url: str, outtmpl: str, cookiefile: str | None, prefer_ios: bool = False) -> Path | None:
+    # format ladder: prefer m4a, then webm, then anything
+    fmt = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": fmt,
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
-        # no postprocessor -> we keep the native container (webm/m4a)
         "retries": 10,
         "fragment_retries": 10,
         "sleep_requests": 1,
-        "http_headers": {"User-Agent": "Mozilla/5.0", "Referer": "https://www.youtube.com/"},
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.youtube.com/",
+        },
         "geo_bypass": True,
+        "concurrent_fragment_downloads": 1,
+        "socket_timeout": 30,
     }
+    # Brug “web” (default). Hvis prefer_ios=True, prøv iOS-client som alternativ.
+    if prefer_ios:
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": ["ios"]}}
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
-    # pick whatever file was written
-    files = list(tmpdir.glob(f"{video_id}.*"))
-    if not files:
-        raise RuntimeError("Audio download failed")
-    return files[0]
+        ydl.download([url])
+
+    # find filen ud fra skabelonen (kan være m4a, webm, …)
+    outdir = Path(outtmpl).parent
+    stem = Path(outtmpl).name.split(".")[0]  # video_id
+    matches = list(outdir.glob(f"{stem}.*"))
+    if not matches:
+        return None
+    # vælg den største (>0 bytes)
+    best = max(matches, key=lambda p: p.stat().st_size)
+    return best if best.stat().st_size > 0 else None
+
+def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
+    tmpdir = Path(tempfile.mkdtemp())
+    outtmpl = str(tmpdir / f"{video_id}.%(ext)s")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cookiefile = write_cookies_if_any(cookies_text)
+
+    # 1) normal (web client)
+    p = try_download(url, outtmpl, cookiefile, prefer_ios=False)
+    if p and p.stat().st_size > 0:
+        return p
+    # 2) alternativ client (iOS) – kan omgå enkelte 403/empty cases
+    p = try_download(url, outtmpl, cookiefile, prefer_ios=True)
+    if p and p.stat().st_size > 0:
+        return p
+    # give up
+    raise RuntimeError("Audio download failed or produced empty file")
 
 # -------- ASR via OpenAI Whisper API --------
 def transcribe_with_openai(file_path: Path, language: str | None):
@@ -186,6 +227,14 @@ with st.sidebar:
     language = st.text_input("Language (e.g., 'da' or leave empty for auto)", value="da")
     max_videos = st.number_input("Limit videos (0 = all)", min_value=0, max_value=2000, value=0, step=1)
     st.caption("All data is stored in Supabase (shared across the team).")
+
+    st.markdown("**Optional cookies.txt** (Netscape format)")
+    cookies_text = st.text_area(
+        "Paste cookies here (starts with '# Netscape HTTP Cookie File')",
+        value="",
+        height=120,
+        help="Use a browser extension like 'Get cookies.txt locally' on youtube.com, then paste the file content here."
+    )
 
 tab_idx, tab_search = st.tabs(["📦 Index", "🔎 Search"])
 
@@ -221,7 +270,7 @@ with tab_idx:
                         if segs:
                             insert_segments(pid, vid, segs)
                     if (not segs) and allow_asr:
-                        audio = download_audio_tmp(vid)
+                        audio = download_audio_tmp(vid, cookies_text)
                         segs = transcribe_with_openai(audio, language.strip() or None)
                         insert_segments(pid, vid, segs)
                 except Exception as e:
