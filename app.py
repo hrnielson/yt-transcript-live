@@ -261,17 +261,15 @@ def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
     cookiefile = _write_cookies_if_any(cookies_text)
 
     fmt_list = [
-        # Brug understøttede operators: ^= (prefix), = (exact), *= (contains)
+    # Brug understøttede operators: ^= (starter med), *= (indeholder)
         "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio",
         "bestaudio[ext=webm]/bestaudio[acodec*=opus]/bestaudio",
         "bestaudio/best",
-        "best",
-    ]/bestaudio[ext=m4a]/bestaudio",
-        "bestaudio[ext=webm]/bestaudio",
-        "bestaudio/best",
-        "best",
+        "best"
     ]
+
     clients = ["android", "ios", "mweb", "web_embedded", "web", None]  # sidste forsøg uden client args
+
 
     try:
         for cli in clients:
