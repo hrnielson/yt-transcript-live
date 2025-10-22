@@ -11,7 +11,6 @@ import httpx
 import pandas as pd
 import streamlit as st
 import yt_dlp
-st.sidebar.caption(f"yt-dlp: {yt_dlp.version.__version__}")
 from openai import OpenAI
 from supabase import Client, create_client
 from youtube_transcript_api import (NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi)
@@ -354,6 +353,8 @@ with st.sidebar:
         height=120,
         help="Export with 'Get cookies.txt locally' while on youtube.com.",
     )
+
+st.sidebar.caption(f"yt-dlp: {yt_dlp.version.__version__}")
 
 if "pid" not in st.session_state:
     st.session_state.pid = None
