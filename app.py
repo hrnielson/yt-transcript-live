@@ -241,7 +241,7 @@ def transcribe_with_openai(file_path: Path, language: str | None):
 
 # ----------------- UI -----------------
 st.set_page_config(page_title="YouTube Quote Finder (Cloud)", layout="wide")
-st.title("YouTube Quote Finder — Cloud (OpenAI only)")
+st.title("YouTube Quote Finder")
 
 with st.sidebar:
     st.header("Settings")
