@@ -474,6 +474,36 @@ with tab_search:
                     "text/csv",
                 )
 
+def diagnose_video(video_id: str, cookies_text: str = "") -> dict:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cookiefile = _write_cookies_if_any(cookies_text)
+    opts = {"quiet": True, "skip_download": True, "noplaylist": True,
+            "http_headers": {"User-Agent": "Mozilla/5.0"}, "force_ipv4": True}
+    if cookiefile: opts["cookiefile"] = cookiefile
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    ps = info.get("playability_status") or {}
+    return {
+        "ok": True,
+        "formats": len(info.get("formats") or []),
+        "age_limit": info.get("age_limit"),
+        "availability": info.get("availability"),
+        "playable_in_embed": info.get("playable_in_embed"),
+        "status": ps.get("status"),
+        "reason": ps.get("reason"),
+        "uploader": info.get("uploader"),
+        "title": info.get("title"),
+    }
+
+with st.expander("Diagnostics"):
+    vid = st.text_input("Video ID", value="SDm_sdmz-FU")
+    if st.button("Run diagnostics"):
+        st.json(diagnose_video(vid, cookies_text))
+
+
 # ---------- Notes ----------
 # DB requirement: ensure a unique constraint on (project_id, video_id, start) for segments to keep runs idempotent, e.g.:
 # ALTER TABLE segments ADD CONSTRAINT segments_unique UNIQUE (project_id, video_id, start);
