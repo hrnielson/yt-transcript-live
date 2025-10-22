@@ -15,25 +15,6 @@ from openai import OpenAI
 from supabase import Client, create_client
 from youtube_transcript_api import (NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi)
 
-# --- Simple in-app logger that writes into an expander ---
-def init_logger(label: str = "Process log", expanded: bool = False):
-    if "logs" not in st.session_state:
-        st.session_state.logs = []
-    box = st.expander(label, expanded=expanded)
-    area = box.empty()
-
-    def log(msg: str):
-        # keep the last ~8k chars to avoid huge DOM
-        st.session_state.logs.append(str(msg))
-        text = "\n".join(st.session_state.logs)
-        area.code(text[-8000:])
-
-    def clear():
-        st.session_state.logs = []
-        area.code("")
-
-    return log, clear
-
 # ---------- Secrets / Clients ----------
 # These must be configured in Streamlit secrets.
 SB_URL = st.secrets["SUPABASE_URL"]
@@ -395,11 +376,6 @@ with tab_idx:
     project_name = st.text_input("Project name", placeholder="Client A")
     channel_url = st.text_input("Channel handle or URL", placeholder="@brand or https://www.youtube.com/@brand")
     if st.button("Start indexing", type="primary", disabled=not (project_name and channel_url)):
-        # Create a collapsible log area for this run
-        log, clear_log = init_logger("Process log", expanded=False)
-        clear_log()  # fresh log for each run
-        log("🚀 Started indexing...")
-
         pid = get_or_create_project(project_name, channel_url)
         st.session_state.pid = pid
         st.info("Fetching video list via YouTube Data API…")
