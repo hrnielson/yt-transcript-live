@@ -1,8 +1,8 @@
 # app.py — YouTube Quote Finder (Cloud, OpenAI-only)
 # Streamlit + Supabase + YouTube Data API v3 + Captions-first + OpenAI Whisper
-# 2025-ready edition with manual Channel ID override
+# 2025-ready edition with robust yt-dlp, caption fallbacks, Whisper fallback, idempotent DB, and temp cleanup
 
-import os, re, time, datetime, tempfile
+import os, re, time, datetime, tempfile, shutil
 from pathlib import Path
 import streamlit as st
 import pandas as pd
@@ -44,7 +44,8 @@ def upsert_video(project_id: str, v: dict):
         "published_at": v.get("published_at"),
         "url": v["url"],
     }
-    supabase.table("videos").upsert(row).execute()
+    # requires PK/unique on id
+    supabase.table("videos").upsert(row, on_conflict="id").execute()
 
 def insert_segments(project_id: str, video_id: str, segments: list[dict]):
     if not segments:
@@ -62,8 +63,9 @@ def insert_segments(project_id: str, video_id: str, segments: list[dict]):
             "speaker": s.get("speaker") or None,
             "content": txt,
         })
+    # requires unique index on (project_id, video_id, start)
     for i in range(0, len(rows), 500):
-        supabase.table("segments").insert(rows[i:i+500]).execute()
+        supabase.table("segments").upsert(rows[i:i+500], on_conflict="project_id,video_id,start").execute()
 
 def search_segments(project_id: str, q: str, limit: int = 100):
     r = supabase.rpc("segments_search", {"p_project": project_id, "p_query": q, "p_limit": limit}).execute()
@@ -73,7 +75,10 @@ def search_segments(project_id: str, q: str, limit: int = 100):
 def _http_get(url: str, params: dict, timeout=60):
     with httpx.Client(timeout=timeout) as c:
         r = c.get(url, params=params)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"HTTP {e.response.status_code} on {url.split('/')[-1]} with params: { {k:v for k,v in params.items() if k!='key'} }") from e
         return r.json()
 
 # ---------- YouTube Data API ----------
@@ -102,8 +107,8 @@ def _resolve_channel_id(handle_or_url: str) -> str:
         data = _http_get(f"{base}/channels", {"part":"id","forUsername":username,"key":YOUTUBE_API_KEY})
         items = data.get("items", [])
         if items: return items[0]["id"]
-    q = handle_or_url.replace("https://www.youtube.com/","").strip()
-    data = _http_get(f"{base}/search", {"part":"snippet","type":"channel","q":q,"maxResults":1,"key":YOUTUBE_API_KEY})
+    q = (handle_or_url or "").replace("https://www.youtube.com/"," ").strip()
+    data = _http_get(f"{base}/search", {"part":"snippet","type":"channel","q":q or "","maxResults":1,"key":YOUTUBE_API_KEY})
     items = data.get("items", [])
     if items: return items[0]["snippet"]["channelId"]
     raise RuntimeError("Channel not found via YouTube API.")
@@ -139,17 +144,40 @@ def list_videos_by_channel_id(channel_id: str):
 def fetch_youtube_captions(video_id: str, preferred=("da","en","no","sv")):
     try:
         ts_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+        # 1) Direkte match på foretrukne sprog
         for lang in preferred:
             try:
                 tr = ts_list.find_transcript([lang])
-                return [{"start":s["start"],"duration":s.get("duration",0),"text":s.get("text","")} for s in tr.fetch()]
-            except Exception: pass
+                return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr.fetch()]
+            except Exception:
+                pass
+
+        # 2) Manuelt lavede > auto-generated
         try:
-            tr = ts_list.find_manually_created_transcript([t.language_code for t in ts_list])
-            return [{"start":s["start"],"duration":s.get("duration",0),"text":s.get("text","")} for s in tr.fetch()]
+            all_langs = [t.language_code for t in ts_list]
+            tr = ts_list.find_manually_created_transcript(all_langs)
+            return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr.fetch()]
         except Exception:
-            tr = ts_list.find_generated_transcript([t.language_code for t in ts_list])
-            return [{"start":s["start"],"duration":s.get("duration",0),"text":s.get("text","")} for s in tr.fetch()]
+            pass
+        try:
+            all_langs = [t.language_code for t in ts_list]
+            tr = ts_list.find_generated_transcript(all_langs)
+            return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr.fetch()]
+        except Exception:
+            pass
+
+        # 3) Oversæt til engelsk som sidste fallback (hvis muligt)
+        try:
+            for t in ts_list:
+                try:
+                    tr_en = t.translate('en')
+                    return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr_en.fetch()]
+                except Exception:
+                    continue
+        except Exception:
+            return None
+
     except (TranscriptsDisabled, NoTranscriptFound):
         return None
     except Exception:
@@ -157,63 +185,117 @@ def fetch_youtube_captions(video_id: str, preferred=("da","en","no","sv")):
 
 # ---------- Downloader ----------
 def _write_cookies_if_any(cookies_text: str) -> str | None:
-    if not cookies_text or "# Netscape" not in cookies_text:
+    if not cookies_text:
         return None
-    tmp = Path(tempfile.mkdtemp()) / "cookies.txt"
-    tmp.write_text(cookies_text, encoding="utf-8")
-    return str(tmp)
+    tmpdir = Path(tempfile.mkdtemp(prefix="cookies_"))
+    cookiefile = tmpdir / "cookies.txt"
+    cookiefile.write_text(cookies_text, encoding="utf-8")
+    if "# Netscape" not in cookies_text:
+        st.caption("⚠️ Cookies.txt uden Netscape-header – fortsætter alligevel.")
+    return str(cookiefile)
 
-def _try_download(url, outtmpl, fmt, cookiefile, client):
-    opts = {
-        "format": fmt, "outtmpl": outtmpl, "noplaylist": True, "quiet": True,
-        "retries": 8, "fragment_retries": 8, "sleep_requests": 1,
-        "http_headers": {"User-Agent": "Mozilla/5.0"}, "geo_bypass": True
+def _try_download(url, outtmpl, fmt, cookiefile, client, merge_to="m4a"):
+    ytdl_opts = {
+        "format": fmt,
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "retries": 6,
+        "fragment_retries": 6,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
+        "geo_bypass": True,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": merge_to, "preferredquality": "0"}
+        ],
+        "merge_output_format": merge_to,
+        "concurrent_fragment_downloads": 4,
+        "overwrites": True,
     }
-    if cookiefile: opts["cookiefile"] = cookiefile
-    if client: opts["extractor_args"] = {"youtube":{"player_client":[client]}}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([url])
-    except Exception: return None
-    outdir = Path(outtmpl).parent; stem = Path(outtmpl).name.split(".")[0]
-    matches = list(outdir.glob(f"{stem}.*"))
-    if not matches: return None
-    best = max(matches, key=lambda p: p.stat().st_size)
-    return best if best.exists() and best.stat().st_size>0 else None
+    if cookiefile:
+        ytdl_opts["cookiefile"] = cookiefile
+    if client:
+        ytdl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
 
-def download_audio_tmp(video_id: str, cookies_text="") -> Path:
-    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        st.caption(f"yt-dlp fejl ({client}/{fmt}): {e}")
+        return None
+
+    outdir = Path(outtmpl).parent
+    stem = Path(outtmpl).name.split(".")[0]
+    matches = list(outdir.glob(f"{stem}.*"))
+    if not matches:
+        return None
+    best = max(matches, key=lambda p: p.stat().st_size)
+    return best if best.exists() and best.stat().st_size > 0 else None
+
+def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
+    tmpdir = Path(tempfile.mkdtemp(prefix=f"yqf_{video_id}_"))
     outtmpl = str(tmpdir / f"{video_id}.%(ext)s")
     url = f"https://www.youtube.com/watch?v={video_id}"
     cookiefile = _write_cookies_if_any(cookies_text)
-    fmt_list = [
-        "bestaudio[ext=m4a][protocol^=https]/bestaudio/best",
-        "bestaudio[protocol^=m3u8]/best"
-    ]
-    for cli in ["web","mweb","web_embedded","ios"]:
-        for fmt in fmt_list:
-            p = _try_download(url, outtmpl, fmt, cookiefile, cli)
-            if p: return p
-    raise RuntimeError("No available format could be downloaded (all strategies failed)")
 
-# ---------- OpenAI Whisper ----------
+    fmt_list = [
+        "bestaudio[acodec~*=^mp4a]/bestaudio[ext=m4a]/bestaudio",
+        "bestaudio[ext=webm]/bestaudio",
+        "bestaudio/best",
+        "best",
+    ]
+    clients = ["android", "ios", "mweb", "web_embedded", "web"]
+
+    try:
+        for cli in clients:
+            for fmt in fmt_list:
+                p = _try_download(url, outtmpl, fmt, cookiefile, cli)
+                if p:
+                    return p
+        raise RuntimeError("No available format could be downloaded (all strategies failed)")
+    except Exception:
+        # cleanup if failed
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            if cookiefile:
+                try:
+                    shutil.rmtree(Path(cookiefile).parent, ignore_errors=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        raise
+
+# ---------- OpenAI Whisper (fallback chain) ----------
 def transcribe_with_openai(file_path: Path, language: str | None):
-    with open(file_path, "rb") as f:
-        resp = oa_client.audio.transcriptions.create(
-            model="whisper-1", file=f,
-            language=language if language else None,
-            response_format="verbose_json"
-        )
-    segs = []
-    try: segments = getattr(resp, "segments", None)
-    except Exception: segments = None
-    if segments:
-        for s in segments:
-            segs.append({"start": float(s["start"]),
-                         "duration": float(s["end"])-float(s["start"]),
-                         "text": s["text"].strip()})
-    elif getattr(resp,"text",None):
-        segs = [{"start":0,"duration":0,"text":resp.text}]
-    return segs
+    model_candidates = ["gpt-4o-mini-transcribe", "whisper-1"]
+    last_err = None
+    for mdl in model_candidates:
+        try:
+            with open(file_path, "rb") as f:
+                resp = oa_client.audio.transcriptions.create(
+                    model=mdl,
+                    file=f,
+                    language=language if language else None,
+                    response_format="verbose_json"
+                )
+            segs = []
+            segments = getattr(resp, "segments", None)
+            if segments:
+                for s in segments:
+                    start = float(s.get("start", 0))
+                    end = float(s.get("end", start))
+                    segs.append({
+                        "start": start,
+                        "duration": max(0.0, end - start),
+                        "text": (s.get("text") or "").strip()
+                    })
+            elif getattr(resp, "text", None):
+                segs = [{"start": 0, "duration": 0, "text": resp.text.strip()}]
+            return segs
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"OpenAI transcription failed: {last_err}")
 
 # ---------- UI ----------
 st.set_page_config(page_title="YouTube Quote Finder", layout="wide")
@@ -233,10 +315,18 @@ with st.sidebar:
         height=120, help="Export with 'Get cookies.txt locally' while on youtube.com"
     )
 
+if "pid" not in st.session_state:
+    st.session_state.pid = None
+if "resolved_channel_id" not in st.session_state:
+    st.session_state.resolved_channel_id = None
+
+
 tab_idx, tab_search = st.tabs(["📦 Index", "🔎 Search"])
 
 def hhmmss(sec: float):
-    s = int(sec or 0); h, r = divmod(s,3600); m, s = divmod(r,60)
+    s = int(round(sec or 0))
+    h, r = divmod(s,3600)
+    m, s = divmod(r,60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 with tab_idx:
@@ -245,16 +335,19 @@ with tab_idx:
     channel_url = st.text_input("Channel handle or URL", placeholder="@brand or https://www.youtube.com/@brand")
     if st.button("Start indexing", type="primary", disabled=not(project_name and channel_url)):
         pid = get_or_create_project(project_name, channel_url)
+        st.session_state.pid = pid
         st.info("Fetching video list via YouTube Data API…")
         try:
             chan_id = channel_id_override.strip()
             if chan_id:
                 st.success(f"Using provided Channel ID: {chan_id}")
                 videos = list_videos_by_channel_id(chan_id)
+                st.session_state.resolved_channel_id = chan_id
             else:
                 cid = _resolve_channel_id(channel_url)
                 st.info(f"Resolved Channel ID: {cid}")
                 videos = list_videos_by_channel_id(cid)
+                st.session_state.resolved_channel_id = cid
         except Exception as e:
             st.error(f"Could not list videos: {e}")
             videos = []
@@ -269,17 +362,30 @@ with tab_idx:
             for v in videos:
                 vid=v["video_id"]; upsert_video(pid,v)
                 st.write(f"Processing {v['title']}")
+                segs=None
+                audio_path=None
+                cookiefile=None
                 try:
-                    segs=None
                     if captions_first:
                         segs=fetch_youtube_captions(vid)
-                        if segs: insert_segments(pid,vid,segs)
+                        if segs:
+                            insert_segments(pid,vid,segs)
                     if not segs:
-                        audio=download_audio_tmp(vid,cookies_text)
-                        segs=transcribe_with_openai(audio,language.strip() or None)
+                        audio_path=download_audio_tmp(vid,cookies_text)
+                        segs=transcribe_with_openai(audio_path, (language or "").split("-")[0].strip() or None)
                         insert_segments(pid,vid,segs)
+                    if not segs:
+                        st.warning(f"No segments for {vid} (captions+ASR failed).")
                 except Exception as e:
                     st.warning(f"Skipped {vid}: {e}")
+                finally:
+                    # cleanup temp dir for this video
+                    try:
+                        if audio_path and isinstance(audio_path, Path):
+                            tmp_parent = audio_path.parent
+                            shutil.rmtree(tmp_parent, ignore_errors=True)
+                    except Exception:
+                        pass
                 done+=1
                 prog.progress(int(done/total*100), text=f"Indexing… {done}/{total}")
             st.success("✅ Done indexing.")
@@ -306,8 +412,10 @@ with tab_search:
             if not rows: st.info("No results.")
             else:
                 df=pd.DataFrame(rows)
-                df["timestamp"]=df["start"].fillna(0).map(hhmmss)
-                df=df[["title","speaker","content","timestamp","url"]].rename(columns={"content":"quote"})
+                if "start" in df:
+                    df["timestamp"]=df["start"].fillna(0).map(hhmmss)
+                cols=[c for c in ["title","speaker","content","timestamp","url"] if c in df.columns]
+                df=df[cols].rename(columns={"content":"quote"})
                 st.dataframe(df, use_container_width=True)
                 st.download_button("Download CSV",
                                    df.to_csv(index=False).encode("utf-8"),
