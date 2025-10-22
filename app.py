@@ -184,66 +184,32 @@ def fetch_youtube_captions(video_id: str, preferred=("da","en","no","sv")):
         return None
 
 # ---------- Downloader ----------
-def _write_cookies_if_any(cookies_text: str) -> str | None:
-    if not cookies_text:
-        return None
-    tmpdir = Path(tempfile.mkdtemp(prefix="cookies_"))
-    cookiefile = tmpdir / "cookies.txt"
-    cookiefile.write_text(cookies_text, encoding="utf-8")
-    if "# Netscape" not in cookies_text:
-        st.caption("⚠️ Cookies.txt uden Netscape-header – fortsætter alligevel.")
-    return str(cookiefile)
-
-def _try_download(url, outtmpl, fmt, cookiefile, client, merge_to="m4a"):
-    # Preflight: list available formats for better diagnostics
-    pre_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "http_headers": {"User-Agent": "Mozilla/5.0"},
-    }
-    if cookiefile:
-        pre_opts["cookiefile"] = cookiefile
-    if client:
-        pre_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
-    try:
-        with yt_dlp.YoutubeDL(pre_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            fmts = info.get("formats", []) or []
-            if fmts:
-                # Vis hvad der faktisk findes (kort)
-                sample = [f"{f.get('format_id')}:{f.get('ext')}/{f.get('acodec')}:{f.get('abr')}kbps" for f in fmts if f.get('acodec') and f.get('vcodec') in ("none", None)]
-                if sample:
-                    st.caption("Tilgængelige audio-formater → " + ", ".join(sample[:8]) + (" …" if len(sample)>8 else ""))
-    except Exception as e:
-        st.caption(f"yt-dlp preflight fejl ({client}): {e}")
-
+def _try_download(url, outtmpl, fmt, cookiefile, merge_to="m4a"):
     ytdl_opts = {
         "format": fmt,
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
-        "retries": 6,
-        "fragment_retries": 6,
+        "retries": 4,
+        "fragment_retries": 4,
         "http_headers": {"User-Agent": "Mozilla/5.0"},
         "geo_bypass": True,
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": merge_to, "preferredquality": "0"}
         ],
         "merge_output_format": merge_to,
-        "concurrent_fragment_downloads": 4,
+        "concurrent_fragment_downloads": 3,
         "overwrites": True,
+        "force_ipv4": True,
     }
     if cookiefile:
         ytdl_opts["cookiefile"] = cookiefile
-    if client:
-        ytdl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
 
     try:
         with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
             ydl.download([url])
     except Exception as e:
-        st.caption(f"yt-dlp fejl ({client}/{fmt}): {e}")
+        st.caption(f"yt-dlp fejl ({fmt}): {e}")
         return None
 
     outdir = Path(outtmpl).parent
@@ -260,68 +226,29 @@ def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
     url = f"https://www.youtube.com/watch?v={video_id}"
     cookiefile = _write_cookies_if_any(cookies_text)
 
+    # Hårdfør rækkefølge: specifikke format-id'er -> brede fallbacks
     fmt_list = [
-    # Brug understøttede operators: ^= (starter med), *= (indeholder)
-        "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio",
-        "bestaudio[ext=webm]/bestaudio[acodec*=opus]/bestaudio",
+        "140",                         # m4a 128kbps (meget udbredt)
+        "251",                         # webm/opus ~160kbps
+        "bestaudio[ext=m4a]/bestaudio",
         "bestaudio/best",
-        "best"
+        "best",
     ]
 
-    clients = ["android", "ios", "mweb", "web_embedded", "web", None]  # sidste forsøg uden client args
-
-
     try:
-        for cli in clients:
-            for fmt in fmt_list:
-                p = _try_download(url, outtmpl, fmt, cookiefile, cli)
-                if p:
-                    return p
+        for fmt in fmt_list:
+            p = _try_download(url, outtmpl, fmt, cookiefile)
+            if p:
+                return p
         raise RuntimeError("No available format could be downloaded (all strategies failed)")
     except Exception:
-        # cleanup if failed
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
             if cookiefile:
-                try:
-                    shutil.rmtree(Path(cookiefile).parent, ignore_errors=True)
-                except Exception:
-                    pass
+                shutil.rmtree(Path(cookiefile).parent, ignore_errors=True)
         except Exception:
             pass
         raise
-
-# ---------- OpenAI Whisper (fallback chain) ----------
-def transcribe_with_openai(file_path: Path, language: str | None):
-    model_candidates = ["gpt-4o-mini-transcribe", "whisper-1"]
-    last_err = None
-    for mdl in model_candidates:
-        try:
-            with open(file_path, "rb") as f:
-                resp = oa_client.audio.transcriptions.create(
-                    model=mdl,
-                    file=f,
-                    language=language if language else None,
-                    response_format="verbose_json"
-                )
-            segs = []
-            segments = getattr(resp, "segments", None)
-            if segments:
-                for s in segments:
-                    start = float(s.get("start", 0))
-                    end = float(s.get("end", start))
-                    segs.append({
-                        "start": start,
-                        "duration": max(0.0, end - start),
-                        "text": (s.get("text") or "").strip()
-                    })
-            elif getattr(resp, "text", None):
-                segs = [{"start": 0, "duration": 0, "text": resp.text.strip()}]
-            return segs
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"OpenAI transcription failed: {last_err}")
 
 # ---------- UI ----------
 st.set_page_config(page_title="YouTube Quote Finder", layout="wide")
