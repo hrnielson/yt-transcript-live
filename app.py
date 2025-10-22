@@ -11,6 +11,7 @@ import httpx
 import pandas as pd
 import streamlit as st
 import yt_dlp
+st.sidebar.caption(f"yt-dlp: {yt_dlp.version.__version__}")
 from openai import OpenAI
 from supabase import Client, create_client
 from youtube_transcript_api import (NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi)
