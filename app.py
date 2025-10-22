@@ -1,3 +1,7 @@
+# app.py — YouTube Quote Finder (Cloud)
+# Streamlit Cloud UI + Supabase storage + OpenAI Whisper API for ASR
+# Robust yt-dlp download with flexible format strategies and cookies support.
+
 import os, io, tempfile, time, datetime
 from pathlib import Path
 import streamlit as st
@@ -120,82 +124,20 @@ def fetch_youtube_captions(video_id: str, preferred=("da","en","no","sv")):
     except Exception:
         return None
 
-# ----------------- Robust format probing & download -----------------
-def pick_best_available_format(info: dict) -> tuple[str, str]:
-    """
-    Choose an actually existing format id:
-      1) audio-only (prefer m4a/webm, higher abr/asr)
-      2) fallback to progressive (audio+video)
-    Returns (format_id, ext)
-    """
-    formats = info.get("formats") or []
-    audio = []
-    for f in formats:
-        if f.get("acodec") and f["acodec"] != "none" and (f.get("vcodec") in (None, "none")):
-            abr = f.get("abr") or 0
-            asr = f.get("asr") or 0
-            ext = f.get("ext") or ""
-            pref_ext = 2 if ext == "m4a" else (1 if ext == "webm" else 0)
-            audio.append((pref_ext, abr, asr, f))
-    if audio:
-        audio.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-        f = audio[0][3]
-        return f["format_id"], f.get("ext") or "m4a"
-
-    prog = []
-    for f in formats:
-        if (f.get("acodec") and f["acodec"] != "none") and (f.get("vcodec") and f["vcodec"] != "none"):
-            height = f.get("height") or 0
-            tbr = f.get("tbr") or 0
-            prog.append((height, tbr, f))
-    if prog:
-        prog.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        f = prog[0][2]
-        return f["format_id"], f.get("ext") or "mp4"
-
-    if formats:
-        f = formats[-1]
-        return f.get("format_id") or "best", f.get("ext") or "mp4"
-
-    raise RuntimeError("No downloadable formats found")
-
-def write_cookies_if_any(cookies_text: str) -> str | None:
+# ----------------- Robust flexible downloader -----------------
+def _write_cookies_if_any(cookies_text: str) -> str | None:
+    """Save Netscape-format cookies to a temp file and return its path, else None."""
     if not cookies_text or "# Netscape" not in cookies_text:
         return None
     tmp = Path(tempfile.mkdtemp()) / "cookies.txt"
     tmp.write_text(cookies_text, encoding="utf-8")
     return str(tmp)
 
-def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
-    """
-    Download a *real* available format:
-      - prefer audio-only; fallback to progressive.
-      - return path to downloaded file (.m4a/.webm/.mp4…)
-    """
-    tmpdir = Path(tempfile.mkdtemp())
-    base = tmpdir / f"{video_id}.%(ext)s"
-    url = f"https://www.youtube.com/watch?v={video_id}"
-
-    cookiefile = write_cookies_if_any(cookies_text)
-
-    # Probe formats first
-    probe_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "http_headers": {"User-Agent": "Mozilla/5.0", "Referer": "https://www.youtube.com/"},
-        "geo_bypass": True,
-    }
-    if cookiefile:
-        probe_opts["cookiefile"] = cookiefile
-    with yt_dlp.YoutubeDL(probe_opts) as y:
-        info = y.extract_info(url, download=False)
-
-    fmt_id, ext = pick_best_available_format(info)
-
-    # Download that exact format id
+def _try_download_with_format(url: str, outtmpl: str, fmt: str, cookiefile: str | None, client: str | None) -> Path | None:
+    """Try one flexible format string and optional YouTube client ('web'/'ios'). Return file path or None."""
     ydl_opts = {
-        "format": fmt_id,
-        "outtmpl": str(base),
+        "format": fmt,
+        "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
         "retries": 10,
@@ -205,34 +147,77 @@ def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
         "geo_bypass": True,
         "concurrent_fragment_downloads": 1,
         "socket_timeout": 30,
+        # help choose stable streams if multiple are available
+        "format_sort": ["codec:avc:m4a", "res:480", "vbr", "abr", "filesize"],
     }
     if cookiefile:
         ydl_opts["cookiefile"] = cookiefile
+    if client in ("web", "ios"):
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception:
+        return None
 
-    files = list(tmpdir.glob(f"{video_id}.*"))
-    if not files:
-        raise RuntimeError("Download produced no files")
-    f = max(files, key=lambda p: p.stat().st_size)
-    if f.stat().st_size <= 0:
-        raise RuntimeError("Downloaded file is empty (0 bytes)")
-    return f
+    outdir = Path(outtmpl).parent
+    stem = Path(outtmpl).name.split(".")[0]  # video_id
+    matches = list(outdir.glob(f"{stem}.*"))
+    if not matches:
+        return None
+    best = max(matches, key=lambda p: p.stat().st_size)
+    return best if best.exists() and best.stat().st_size > 0 else None
+
+def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
+    """
+    Robust download: try flexible format expressions in order:
+      1) Audio-only (m4a/webm/bestaudio)
+      2) Progressive (video+audio) MP4/WebM
+      3) Repeat both using iOS client (can help some videos)
+    Returns a path to the downloaded file (.m4a/.webm/.mp4).
+    """
+    tmpdir = Path(tempfile.mkdtemp())
+    outtmpl = str(tmpdir / f"{video_id}.%(ext)s")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cookiefile = _write_cookies_if_any(cookies_text)
+
+    strategies = [
+        ("bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[acodec!=none]", "web"),
+        ("best[acodec!=none][vcodec!=none]/best", "web"),
+        ("bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[acodec!=none]", "ios"),
+        ("best[acodec!=none][vcodec!=none]/best", "ios"),
+    ]
+    for fmt, client in strategies:
+        p = _try_download_with_format(url, outtmpl, fmt, cookiefile, client)
+        if p:
+            return p
+
+    raise RuntimeError("No available format could be downloaded (all strategies failed)")
 
 # ----------------- ASR via OpenAI Whisper API -----------------
 def transcribe_with_openai(file_path: Path, language: str | None):
     with open(file_path, "rb") as f:
-        tr = oa_client.audio.transcriptions.create(
+        resp = oa_client.audio.transcriptions.create(
             model="whisper-1",
             file=f,
             language=language if language else None,
             response_format="verbose_json",
         )
+    # The SDK returns an object with .text and .segments when verbose_json.
     segs = []
-    # OpenAI SDK returns dict-like object; access with keys
-    segments = getattr(tr, "segments", None) or tr.get("segments") if isinstance(tr, dict) else None
-    text = getattr(tr, "text", None) or tr.get("text") if isinstance(tr, dict) else None
+    # Try attribute access first
+    try:
+        segments = getattr(resp, "segments", None)
+        text = getattr(resp, "text", None)
+    except Exception:
+        segments = None
+        text = None
+    # Fallback to dict-like access
+    if segments is None and isinstance(resp, dict):
+        segments = resp.get("segments")
+        text = resp.get("text")
+
     if segments:
         for s in segments:
             start = float(s["start"]); end = float(s["end"])
@@ -258,12 +243,12 @@ with st.sidebar:
         height=120,
         help="Export with a browser extension like 'Get cookies.txt locally' while on youtube.com"
     )
-    st.caption("Data is stored in Supabase and shared with your team.")
+    st.caption("All data is stored in Supabase and shared across your team.")
 
 tab_idx, tab_search = st.tabs(["📦 Index", "🔎 Search"])
 
 def hhmmss(sec: int):
-    hh, r = divmod(sec, 3600)
+    hh, r = divmod(int(sec), 3600)
     mm, ss = divmod(r, 60)
     return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
@@ -332,7 +317,7 @@ with tab_search:
                 st.info("No results.")
             else:
                 df = pd.DataFrame(rows)
-                df["timestamp"] = df["start"].fillna(0).astype(int).map(hhmmss)
+                df["timestamp"] = df["start"].fillna(0).map(hhmmss)
                 df = df[["title","speaker","content","timestamp","url"]].rename(columns={"content":"quote"})
                 st.dataframe(df, use_container_width=True)
                 st.download_button("Download CSV",
