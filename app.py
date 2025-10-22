@@ -7,7 +7,8 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-
+import yt_dlp
+st.sidebar.caption(f"yt-dlp version: {yt_dlp.version.__version__}")
 import httpx
 import pandas as pd
 import streamlit as st
@@ -15,9 +16,6 @@ import yt_dlp
 from openai import OpenAI
 from supabase import Client, create_client
 from youtube_transcript_api import (NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi)
-
-import yt_dlp
-st.sidebar.caption(f"yt-dlp version: {yt_dlp.version.__version__}")
 
 
 # ---------- Secrets / Clients ----------
