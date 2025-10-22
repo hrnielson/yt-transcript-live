@@ -7,8 +7,6 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-import yt_dlp
-st.sidebar.caption(f"yt-dlp version: {yt_dlp.version.__version__}")
 import httpx
 import pandas as pd
 import streamlit as st
