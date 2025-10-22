@@ -195,6 +195,29 @@ def _write_cookies_if_any(cookies_text: str) -> str | None:
     return str(cookiefile)
 
 def _try_download(url, outtmpl, fmt, cookiefile, client, merge_to="m4a"):
+    # Preflight: list available formats for better diagnostics
+    pre_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
+    }
+    if cookiefile:
+        pre_opts["cookiefile"] = cookiefile
+    if client:
+        pre_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+    try:
+        with yt_dlp.YoutubeDL(pre_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            fmts = info.get("formats", []) or []
+            if fmts:
+                # Vis hvad der faktisk findes (kort)
+                sample = [f"{f.get('format_id')}:{f.get('ext')}/{f.get('acodec')}:{f.get('abr')}kbps" for f in fmts if f.get('acodec') and f.get('vcodec') in ("none", None)]
+                if sample:
+                    st.caption("Tilgængelige audio-formater → " + ", ".join(sample[:8]) + (" …" if len(sample)>8 else ""))
+    except Exception as e:
+        st.caption(f"yt-dlp preflight fejl ({client}): {e}")
+
     ytdl_opts = {
         "format": fmt,
         "outtmpl": outtmpl,
@@ -238,12 +261,17 @@ def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
     cookiefile = _write_cookies_if_any(cookies_text)
 
     fmt_list = [
-        "bestaudio[acodec~*=^mp4a]/bestaudio[ext=m4a]/bestaudio",
+        # Brug understøttede operators: ^= (prefix), = (exact), *= (contains)
+        "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio",
+        "bestaudio[ext=webm]/bestaudio[acodec*=opus]/bestaudio",
+        "bestaudio/best",
+        "best",
+    ]/bestaudio[ext=m4a]/bestaudio",
         "bestaudio[ext=webm]/bestaudio",
         "bestaudio/best",
         "best",
     ]
-    clients = ["android", "ios", "mweb", "web_embedded", "web"]
+    clients = ["android", "ios", "mweb", "web_embedded", "web", None]  # sidste forsøg uden client args
 
     try:
         for cli in clients:
