@@ -1,8 +1,9 @@
 # app.py — YouTube Quote Finder (Cloud, OpenAI-only)
 # Streamlit Cloud + Supabase + Captions-first + OpenAI Whisper ASR (file upload)
 # Robust yt-dlp download (audio -> progressive -> HLS) + cookies support.
+# Channel listing via YouTube Data API with robust handle/URL resolver.
 
-import os, time, datetime, tempfile
+import os, re, time, datetime, tempfile
 from pathlib import Path
 import streamlit as st
 import pandas as pd
@@ -70,28 +71,94 @@ def search_segments(project_id: str, q: str, limit: int = 100):
     r = supabase.rpc("segments_search", {"p_project": project_id, "p_query": q, "p_limit": limit}).execute()
     return r.data or []
 
-# ----------------- YouTube Data API v3 (stable listing) -----------------
+# ----------------- HTTP helper -----------------
 def _http_get(url: str, params: dict, timeout=60):
     with httpx.Client(timeout=timeout) as c:
         r = c.get(url, params=params)
         r.raise_for_status()
         return r.json()
 
+# ----------------- Robust channel resolver (YouTube Data API) -----------------
+def _extract_bits(inp: str):
+    """Return (handle, channel_id, username, custom) parsed from many input shapes."""
+    s = (inp or "").strip()
+    # pure handle
+    if s.startswith("@"):
+        return s, None, None, None
+    # full URLs
+    m = re.search(r"youtube\.com/(channel/([^/?#]+))", s, re.I)
+    if m:
+        return None, m.group(2), None, None
+    m = re.search(r"youtube\.com/@([^/?#]+)", s, re.I)
+    if m:
+        return "@" + m.group(1), None, None, None
+    m = re.search(r"youtube\.com/user/([^/?#]+)", s, re.I)
+    if m:
+        return None, None, m.group(1), None
+    m = re.search(r"youtube\.com/c/([^/?#]+)", s, re.I)
+    if m:
+        return None, None, None, m.group(1)
+    # last resort: treat whole string as search query
+    return None, None, None, None
+
 def _resolve_channel_id(handle_or_url: str) -> str:
-    if "/channel/" in handle_or_url:
-        return handle_or_url.split("/channel/")[1].split("/")[0]
+    """Resolve to channelId using the best available API path."""
     base = "https://www.googleapis.com/youtube/v3"
+    handle, ch_id, username, custom = _extract_bits(handle_or_url)
+
+    # 1) direct channel id
+    if ch_id:
+        return ch_id
+
+    # 2) official handle
+    if handle:
+        data = _http_get(f"{base}/channels", {
+            "part": "id",
+            "forHandle": handle,     # <— korrekt endpoint til @handles
+            "key": YOUTUBE_API_KEY
+        })
+        items = data.get("items", [])
+        if items:
+            return items[0]["id"]
+
+    # 3) legacy username (/user/...)
+    if username:
+        data = _http_get(f"{base}/channels", {
+            "part": "id",
+            "forUsername": username,
+            "key": YOUTUBE_API_KEY
+        })
+        items = data.get("items", [])
+        if items:
+            return items[0]["id"]
+
+    # 4) custom URL (/c/...) — ingen direkte API; prøv search
+    if custom:
+        data = _http_get(f"{base}/search", {
+            "part": "snippet",
+            "type": "channel",
+            "q": custom,
+            "maxResults": 1,
+            "key": YOUTUBE_API_KEY
+        })
+        items = data.get("items", [])
+        if items:
+            return items[0]["snippet"]["channelId"]
+
+    # 5) fallback: search på hele inputtet (fx firmanavn eller rå handle)
+    q = handle_or_url.replace("https://www.youtube.com/", "").strip()
     data = _http_get(f"{base}/search", {
         "part": "snippet",
-        "q": handle_or_url.replace("https://www.youtube.com/", "").replace("@",""),
         "type": "channel",
+        "q": q,
         "maxResults": 1,
         "key": YOUTUBE_API_KEY
     })
     items = data.get("items", [])
-    if not items:
-        raise RuntimeError("Channel not found via YouTube API.")
-    return items[0]["snippet"]["channelId"]
+    if items:
+        return items[0]["snippet"]["channelId"]
+
+    raise RuntimeError("Channel not found via YouTube API (tried handle, username, custom URL and search).")
 
 def list_videos_via_youtube_api(channel_url_or_handle: str):
     base = "https://www.googleapis.com/youtube/v3"
