@@ -6,25 +6,21 @@ import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from supabase import create_client, Client
 from openai import OpenAI
-from pathlib import Path
-import tempfile
 
-# ------------- Config from Streamlit secrets -------------
+# ----------------- Config from Streamlit secrets -----------------
 SB_URL = st.secrets["SUPABASE_URL"]
 SB_KEY = st.secrets["SUPABASE_KEY"]
-OPENAI_KEY = st.secrets["OPENAI_API_KEY"]  # or set ASSEMBLYAI_KEY and swap the ASR call
+OPENAI_KEY = st.secrets["OPENAI_API_KEY"]
 
 supabase: Client = create_client(SB_URL, SB_KEY)
 oa_client = OpenAI(api_key=OPENAI_KEY)
 
-# ------------- Helpers -------------
+# ----------------- Supabase helpers -----------------
 def get_or_create_project(name: str, channel_url: str):
-    # find by exact name; create if missing
     res = supabase.table("projects").select("*").eq("name", name).execute()
     if res.data:
         pid = res.data[0]["id"]
-        # update channel url if changed
-        if res.data[0]["channel_url"] != channel_url:
+        if res.data[0].get("channel_url") != channel_url:
             supabase.table("projects").update({"channel_url": channel_url}).eq("id", pid).execute()
         return pid
     ins = supabase.table("projects").insert({"name": name, "channel_url": channel_url}).execute()
@@ -34,23 +30,23 @@ def list_projects():
     res = supabase.table("projects").select("id,name,channel_url,created_at").order("created_at", desc=True).execute()
     return res.data or []
 
-def upsert_video(project_id: str, video):
+def upsert_video(project_id: str, v: dict):
     row = {
-        "id": video["video_id"],
+        "id": v["video_id"],
         "project_id": project_id,
-        "title": video.get("title"),
-        "published_at": video.get("published_at"),
-        "url": video["url"],
+        "title": v.get("title"),
+        "published_at": v.get("published_at"),
+        "url": v["url"],
     }
     supabase.table("videos").upsert(row).execute()
 
-def insert_segments(project_id: str, video_id: str, segments):
+def insert_segments(project_id: str, video_id: str, segments: list[dict]):
     if not segments:
         return
     rows = []
     for s in segments:
         txt = (s.get("text") or s.get("content") or "").strip()
-        if not txt: 
+        if not txt:
             continue
         rows.append({
             "project_id": project_id,
@@ -58,19 +54,17 @@ def insert_segments(project_id: str, video_id: str, segments):
             "start": float(s.get("start", 0)),
             "duration": float(s.get("duration", 0)),
             "speaker": s.get("speaker") or None,
-            "content": txt
+            "content": txt,
         })
-    # batch in chunks to avoid payload limits
     CHUNK = 500
     for i in range(0, len(rows), CHUNK):
         supabase.table("segments").insert(rows[i:i+CHUNK]).execute()
 
 def search_segments(project_id: str, q: str, limit: int = 100):
-    # Use SQL function created in Supabase
     res = supabase.rpc("segments_search", {"p_project": project_id, "p_query": q, "p_limit": limit}).execute()
     return res.data or []
 
-# -------- YouTube: list videos without API key --------
+# ----------------- YouTube: list videos (no API key) -----------------
 def list_videos_no_api(channel_or_playlist_url: str):
     ydl_opts = {"quiet": True, "extract_flat": True, "skip_download": True}
     out = []
@@ -80,39 +74,32 @@ def list_videos_no_api(channel_or_playlist_url: str):
         for e in entries:
             if e.get("_type") == "url" and "watch" in (e.get("url") or ""):
                 vid = e.get("id"); url = e.get("url"); title = e.get("title") or ""
-                ts = e.get("timestamp")
-                published_at = None
-                if ts:
-                    published_at = datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
+                ts = e.get("timestamp"); published_at = None
+                if ts: published_at = datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
                 if vid:
                     out.append({"video_id": vid, "title": title, "published_at": published_at,
                                 "url": url or f"https://www.youtube.com/watch?v={vid}"})
             elif e.get("_type") == "playlist" and e.get("entries"):
                 for ve in e["entries"]:
                     vid = ve.get("id"); title = ve.get("title") or ""
-                    ts = ve.get("timestamp")
-                    published_at = None
-                    if ts:
-                        published_at = datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
+                    ts = ve.get("timestamp"); published_at = None
+                    if ts: published_at = datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
                     if vid:
                         out.append({"video_id": vid, "title": title, "published_at": published_at,
                                     "url": f"https://www.youtube.com/watch?v={vid}"})
             else:
                 if e.get("id") and e.get("webpage_url"):
                     vid = e["id"]; title = e.get("title") or ""
-                    ts = e.get("timestamp")
-                    published_at = None
-                    if ts:
-                        published_at = datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
+                    ts = e.get("timestamp"); published_at = None
+                    if ts: published_at = datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
                     out.append({"video_id": vid, "title": title, "published_at": published_at, "url": e["webpage_url"]})
-    # de-dup
-    seen=set(); uniq=[]
+    seen = set(); uniq = []
     for v in out:
         if v["video_id"] in seen: continue
         seen.add(v["video_id"]); uniq.append(v)
     return uniq
 
-# -------- Captions first --------
+# ----------------- Captions first -----------------
 def fetch_youtube_captions(video_id: str, preferred=("da","en","no","sv")):
     try:
         ts_list = YouTubeTranscriptApi.list_transcripts(video_id)
@@ -133,7 +120,45 @@ def fetch_youtube_captions(video_id: str, preferred=("da","en","no","sv")):
     except Exception:
         return None
 
-# -------- Download audio (no ffmpeg needed: take bestaudio as-is) --------
+# ----------------- Robust format probing & download -----------------
+def pick_best_available_format(info: dict) -> tuple[str, str]:
+    """
+    Choose an actually existing format id:
+      1) audio-only (prefer m4a/webm, higher abr/asr)
+      2) fallback to progressive (audio+video)
+    Returns (format_id, ext)
+    """
+    formats = info.get("formats") or []
+    audio = []
+    for f in formats:
+        if f.get("acodec") and f["acodec"] != "none" and (f.get("vcodec") in (None, "none")):
+            abr = f.get("abr") or 0
+            asr = f.get("asr") or 0
+            ext = f.get("ext") or ""
+            pref_ext = 2 if ext == "m4a" else (1 if ext == "webm" else 0)
+            audio.append((pref_ext, abr, asr, f))
+    if audio:
+        audio.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        f = audio[0][3]
+        return f["format_id"], f.get("ext") or "m4a"
+
+    prog = []
+    for f in formats:
+        if (f.get("acodec") and f["acodec"] != "none") and (f.get("vcodec") and f["vcodec"] != "none"):
+            height = f.get("height") or 0
+            tbr = f.get("tbr") or 0
+            prog.append((height, tbr, f))
+    if prog:
+        prog.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        f = prog[0][2]
+        return f["format_id"], f.get("ext") or "mp4"
+
+    if formats:
+        f = formats[-1]
+        return f.get("format_id") or "best", f.get("ext") or "mp4"
+
+    raise RuntimeError("No downloadable formats found")
+
 def write_cookies_if_any(cookies_text: str) -> str | None:
     if not cookies_text or "# Netscape" not in cookies_text:
         return None
@@ -141,82 +166,82 @@ def write_cookies_if_any(cookies_text: str) -> str | None:
     tmp.write_text(cookies_text, encoding="utf-8")
     return str(tmp)
 
-def try_download(url: str, outtmpl: str, cookiefile: str | None, prefer_ios: bool = False) -> Path | None:
-    # format ladder: prefer m4a, then webm, then anything
-    fmt = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
+    """
+    Download a *real* available format:
+      - prefer audio-only; fallback to progressive.
+      - return path to downloaded file (.m4a/.webm/.mp4…)
+    """
+    tmpdir = Path(tempfile.mkdtemp())
+    base = tmpdir / f"{video_id}.%(ext)s"
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    cookiefile = write_cookies_if_any(cookies_text)
+
+    # Probe formats first
+    probe_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0", "Referer": "https://www.youtube.com/"},
+        "geo_bypass": True,
+    }
+    if cookiefile:
+        probe_opts["cookiefile"] = cookiefile
+    with yt_dlp.YoutubeDL(probe_opts) as y:
+        info = y.extract_info(url, download=False)
+
+    fmt_id, ext = pick_best_available_format(info)
+
+    # Download that exact format id
     ydl_opts = {
-        "format": fmt,
-        "outtmpl": outtmpl,
+        "format": fmt_id,
+        "outtmpl": str(base),
         "noplaylist": True,
         "quiet": True,
         "retries": 10,
         "fragment_retries": 10,
         "sleep_requests": 1,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.youtube.com/",
-        },
+        "http_headers": {"User-Agent": "Mozilla/5.0", "Referer": "https://www.youtube.com/"},
         "geo_bypass": True,
         "concurrent_fragment_downloads": 1,
         "socket_timeout": 30,
     }
-    # Brug “web” (default). Hvis prefer_ios=True, prøv iOS-client som alternativ.
-    if prefer_ios:
-        ydl_opts["extractor_args"] = {"youtube": {"player_client": ["ios"]}}
     if cookiefile:
         ydl_opts["cookiefile"] = cookiefile
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-    # find filen ud fra skabelonen (kan være m4a, webm, …)
-    outdir = Path(outtmpl).parent
-    stem = Path(outtmpl).name.split(".")[0]  # video_id
-    matches = list(outdir.glob(f"{stem}.*"))
-    if not matches:
-        return None
-    # vælg den største (>0 bytes)
-    best = max(matches, key=lambda p: p.stat().st_size)
-    return best if best.stat().st_size > 0 else None
+    files = list(tmpdir.glob(f"{video_id}.*"))
+    if not files:
+        raise RuntimeError("Download produced no files")
+    f = max(files, key=lambda p: p.stat().st_size)
+    if f.stat().st_size <= 0:
+        raise RuntimeError("Downloaded file is empty (0 bytes)")
+    return f
 
-def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
-    tmpdir = Path(tempfile.mkdtemp())
-    outtmpl = str(tmpdir / f"{video_id}.%(ext)s")
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    cookiefile = write_cookies_if_any(cookies_text)
-
-    # 1) normal (web client)
-    p = try_download(url, outtmpl, cookiefile, prefer_ios=False)
-    if p and p.stat().st_size > 0:
-        return p
-    # 2) alternativ client (iOS) – kan omgå enkelte 403/empty cases
-    p = try_download(url, outtmpl, cookiefile, prefer_ios=True)
-    if p and p.stat().st_size > 0:
-        return p
-    # give up
-    raise RuntimeError("Audio download failed or produced empty file")
-
-# -------- ASR via OpenAI Whisper API --------
+# ----------------- ASR via OpenAI Whisper API -----------------
 def transcribe_with_openai(file_path: Path, language: str | None):
     with open(file_path, "rb") as f:
-        # Use Whisper API (whisper-1) — keep it simple
         tr = oa_client.audio.transcriptions.create(
             model="whisper-1",
             file=f,
             language=language if language else None,
-            response_format="verbose_json"
+            response_format="verbose_json",
         )
-    # Build segments compatible with our schema
     segs = []
-    for s in tr.segments:
-        start = float(s["start"]); end = float(s["end"])
-        segs.append({"start": start, "duration": end - start, "text": s["text"].strip()})
-    # Fallback if API returns no per-segment:
-    if not segs and tr.text:
-        segs = [{"start": 0.0, "duration": 0.0, "text": tr.text}]
+    # OpenAI SDK returns dict-like object; access with keys
+    segments = getattr(tr, "segments", None) or tr.get("segments") if isinstance(tr, dict) else None
+    text = getattr(tr, "text", None) or tr.get("text") if isinstance(tr, dict) else None
+    if segments:
+        for s in segments:
+            start = float(s["start"]); end = float(s["end"])
+            segs.append({"start": start, "duration": end - start, "text": s["text"].strip()})
+    elif text:
+        segs = [{"start": 0.0, "duration": 0.0, "text": text}]
     return segs
 
-# -------------------- UI --------------------
+# ----------------- UI -----------------
 st.set_page_config(page_title="YouTube Quote Finder (Cloud)", layout="wide")
 st.title("YouTube Quote Finder — Cloud")
 
@@ -225,16 +250,15 @@ with st.sidebar:
     captions_first = st.toggle("Use captions first", value=True)
     allow_asr = st.toggle("Allow ASR fallback (OpenAI Whisper API)", value=True)
     language = st.text_input("Language (e.g., 'da' or leave empty for auto)", value="da")
-    max_videos = st.number_input("Limit videos (0 = all)", min_value=0, max_value=2000, value=0, step=1)
-    st.caption("All data is stored in Supabase (shared across the team).")
-
+    max_videos = st.number_input("Limit videos (0 = all)", min_value=0, max_value=5000, value=0, step=1)
     st.markdown("**Optional cookies.txt** (Netscape format)")
     cookies_text = st.text_area(
-        "Paste cookies here (starts with '# Netscape HTTP Cookie File')",
+        "Paste cookies (must start with '# Netscape HTTP Cookie File')",
         value="",
         height=120,
-        help="Use a browser extension like 'Get cookies.txt locally' on youtube.com, then paste the file content here."
+        help="Export with a browser extension like 'Get cookies.txt locally' while on youtube.com"
     )
+    st.caption("Data is stored in Supabase and shared with your team.")
 
 tab_idx, tab_search = st.tabs(["📦 Index", "🔎 Search"])
 
@@ -250,7 +274,11 @@ with tab_idx:
     if st.button("Start indexing", type="primary", disabled=not (project_name and channel_url)):
         pid = get_or_create_project(project_name, channel_url)
         st.info("Fetching video list…")
-        videos = list_videos_no_api(channel_url)
+        try:
+            videos = list_videos_no_api(channel_url)
+        except Exception as e:
+            st.error(f"Could not list videos: {e}")
+            videos = []
         if max_videos and max_videos > 0:
             videos = videos[:max_videos]
         if not videos:
@@ -259,10 +287,11 @@ with tab_idx:
             st.success(f"Found {len(videos)} videos.")
             prog = st.progress(0, text="Indexing…")
             status = st.empty()
-            for i, v in enumerate(videos, start=1):
-                upsert_video(pid, v)
+            total = len(videos); processed = 0
+            for v in videos:
                 vid = v["video_id"]
-                status.markdown(f"**Processing:** `{v['title']}` (`{vid}`)")
+                upsert_video(pid, v)
+                status.markdown(f"**Processing:** `{v.get('title','(no title)')}` (`{vid}`)")
                 try:
                     segs = None
                     if captions_first:
@@ -275,7 +304,8 @@ with tab_idx:
                         insert_segments(pid, vid, segs)
                 except Exception as e:
                     st.warning(f"Skipped {vid}: {e}")
-                prog.progress(int(i/len(videos)*100), text=f"Indexing… ({i}/{len(videos)})")
+                processed += 1
+                prog.progress(int(processed/total*100), text=f"Indexing… ({processed}/{total})")
             status.markdown("**Done.**")
 
     st.divider()
@@ -302,10 +332,8 @@ with tab_search:
                 st.info("No results.")
             else:
                 df = pd.DataFrame(rows)
-                # add hh:mm:ss
                 df["timestamp"] = df["start"].fillna(0).astype(int).map(hhmmss)
-                df = df[["title","speaker","content","timestamp","url"]].rename(
-                    columns={"content":"quote"})
+                df = df[["title","speaker","content","timestamp","url"]].rename(columns={"content":"quote"})
                 st.dataframe(df, use_container_width=True)
                 st.download_button("Download CSV",
                                    df.to_csv(index=False).encode("utf-8"),
