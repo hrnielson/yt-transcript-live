@@ -247,6 +247,7 @@ def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merg
         "concurrent_fragment_downloads": 3,
         "overwrites": True,
         "force_ipv4": True,
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
     }
     if cookiefile:
         ytdl_opts["cookiefile"] = cookiefile
