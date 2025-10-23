@@ -84,13 +84,10 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
 
 
 def list_projects():
-    """List existing projects safely (no hard dependency on specific columns)."""
     try:
-        # Vær defensiv: vælg alle kolonner og sorter på noget, der med garanti findes (name)
         r = supabase.table("projects").select("*").order("name", desc=False).execute()
         return r.data or []
     except APIError as e:
-        # Vis den faktiske PostgREST-fejl i UI så vi kan se præcis hvad der mangler / blokerer
         st.error(
             "Supabase APIError on SELECT projects\n"
             f"message: {getattr(e, 'message', None)}\n"
