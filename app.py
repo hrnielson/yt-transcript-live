@@ -8,7 +8,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
-
+from postgrest import APIError
 import httpx
 import pandas as pd
 import streamlit as st
@@ -49,9 +49,21 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
     return ins.data[0]["id"]
 
 def list_projects():
-    """List existing projects (lightweight columns)."""
-    r = supabase.table("projects").select("id,name,channel_url,lang,created_at").order("created_at", desc=True).execute()
-    return r.data or []
+    """List existing projects safely (no hard dependency on specific columns)."""
+    try:
+        # Vær defensiv: vælg alle kolonner og sorter på noget, der med garanti findes (name)
+        r = supabase.table("projects").select("*").order("name", desc=False).execute()
+        return r.data or []
+    except APIError as e:
+        # Vis den faktiske PostgREST-fejl i UI så vi kan se præcis hvad der mangler / blokerer
+        st.error(
+            "Supabase APIError on SELECT projects\n"
+            f"message: {getattr(e, 'message', None)}\n"
+            f"details: {getattr(e, 'details', None)}\n"
+            f"hint: {getattr(e, 'hint', None)}\n"
+            f"code: {getattr(e, 'code', None)}"
+        )
+        raise
 
 def upsert_video(project_id: str, v: dict):
     """Idempotent upsert of a video row by primary key id."""
