@@ -1,6 +1,6 @@
 # app.py — YouTube Quote Finder (Cloud, OpenAI-only)
 # Streamlit + Supabase + YouTube Data API v3 + Captions-first + OpenAI Whisper
-# One-file version with: project language, dedup (never index same video twice), and stable yt-dlp options.
+# One-file version with: project language, dedup, robust yt-dlp, defensive Supabase, RPC search + rich fallback.
 
 import re
 import shutil
@@ -31,7 +31,6 @@ oa_client = OpenAI(api_key=OPENAI_KEY)
 def get_or_create_project(name: str, channel_url: str, lang: str):
     """Create-or-update uden at crashe ved RLS/schema-cache issues."""
     try:
-        # Vælg * så vi ikke fejler på stale schema-cache (fx 'lang' mangler i cache)
         r = supabase.table("projects").select("*").eq("name", name).execute()
     except APIError as e:
         st.error(
@@ -47,7 +46,6 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
         update = {}
         if row.get("channel_url") != channel_url:
             update["channel_url"] = channel_url
-        # Opdater kun lang hvis kolonnen findes i denne række
         if "lang" in row and (row.get("lang") or "auto") != (lang or "auto"):
             update["lang"] = lang or "auto"
 
@@ -524,6 +522,7 @@ with tab_search:
         q = st.text_input("Search term", value="hammer")
         limit = st.slider("Max results", 10, 500, 50, 10)
         if st.button("Search"):
+            # 1) Prøv RPC (med stemming/synonymer + relevans)
             try:
                 res = supabase.rpc("segments_search_by_project", {
                     "p_project": options[sel],
@@ -532,16 +531,36 @@ with tab_search:
                 }).execute()
                 rows = res.data or []
             except APIError as e:
+                # 2) Fallback: simpel ILIKE + berig med title/url
                 st.warning(
                     "RPC failed — falling back to simple LIKE search (no stemming/synonyms).\n"
                     f"code={getattr(e,'code',None)} message={getattr(e,'message',None)}"
                 )
-                rows = supabase.table("segments")\
+                seg_rows = supabase.table("segments")\
                     .select("content,start,video_id,project_id")\
                     .eq("project_id", options[sel])\
                     .ilike("content", f"%{q.strip()}%")\
                     .limit(int(limit))\
                     .execute().data or []
+
+                vid_ids = sorted({r["video_id"] for r in seg_rows})
+                videos_map = {}
+                if vid_ids:
+                    vids = supabase.table("videos")\
+                        .select("id,title,url")\
+                        .in_("id", vid_ids)\
+                        .execute().data or []
+                    videos_map = {v["id"]: {"title": v.get("title"), "url": v.get("url")} for v in vids}
+
+                rows = []
+                for r in seg_rows:
+                    meta = videos_map.get(r["video_id"], {})
+                    rows.append({
+                        "title": meta.get("title"),
+                        "url": meta.get("url"),
+                        "content": r.get("content"),
+                        "start": r.get("start"),
+                    })
 
             if not rows:
                 st.info("No results.")
@@ -549,7 +568,6 @@ with tab_search:
                 df = pd.DataFrame(rows)
                 if "start" in df:
                     df["timestamp"] = df["start"].fillna(0).map(hhmmss)
-                # Hvis RPC returnerer url/title, beholder vi dem; fallback returnerer dem ikke.
                 cols = [c for c in ("title", "speaker", "content", "timestamp", "url") if c in df.columns]
                 if not cols:
                     cols = [c for c in ("content", "timestamp") if c in df.columns]
@@ -603,4 +621,6 @@ with st.expander("Diagnostics"):
 # 2) Unique + performance:
 #    create unique index if not exists segments_unique on public.segments(project_id, video_id, start);
 #    create index if not exists segments_proj_vid_idx on public.segments(project_id, video_id);
-# 3) FTS indexes + RPC 'segments_search_by_project' skal være oprettet og have GRANT EXECUTE til anon (eller brug service role key).
+# 3) RPC 'segments_search_by_project' med signaturen (uuid, text, int) + GRANT EXECUTE til anon,
+#    samt RLS SELECT-policies på public.segments og public.videos. Kør også: create extension if not exists unaccent;
+#    og til sidst: notify pgrst, 'reload schema';
