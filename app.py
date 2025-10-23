@@ -38,15 +38,30 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
             update["channel_url"] = channel_url
         if (r.data[0].get("lang") or "auto") != (lang or "auto"):
             update["lang"] = lang or "auto"
+
         if update:
-            supabase.table("projects").update(update).eq("id", pid).execute()
+            try:
+                supabase.table("projects").update(update).eq("id", pid).execute()
+            except APIError as e:
+                # Vis den rigtige fejl i UI og fald tilbage til upsert på id
+                st.warning(
+                    "UPDATE projects blev blokeret. Forsøger UPSERT i stedet.\n"
+                    f"PostgREST -> code: {getattr(e, 'code', None)} | "
+                    f"message: {getattr(e, 'message', None)} | "
+                    f"details: {getattr(e, 'details', None)} | "
+                    f"hint: {getattr(e, 'hint', None)}"
+                )
+                row = {"id": pid, **update}
+                supabase.table("projects").upsert(row, on_conflict="id").execute()
         return pid
+
     ins = supabase.table("projects").insert({
         "name": name,
         "channel_url": channel_url,
         "lang": lang or "auto",
     }).execute()
     return ins.data[0]["id"]
+
 
 def list_projects():
     """List existing projects safely (no hard dependency on specific columns)."""
