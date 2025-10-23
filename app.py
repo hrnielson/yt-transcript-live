@@ -27,17 +27,28 @@ supabase: Client = create_client(SB_URL, SB_KEY)
 oa_client = OpenAI(api_key=OPENAI_KEY)
 
 # ---------- Supabase helpers ----------
+
 def get_or_create_project(name: str, channel_url: str, lang: str):
-    """Return project id for name; create if missing. Try to update fields, but never crash if RLS/schema-cache blocks."""
-    # Find existing by name
-    r = supabase.table("projects").select("id,channel_url,lang").eq("name", name).execute()
+    """Create-or-update uden at crashe ved RLS/schema-cache issues."""
+    try:
+        # VIGTIGT: vælg * i stedet for at nævne kolonner (lang kan mangle i cache)
+        r = supabase.table("projects").select("*").eq("name", name).execute()
+    except APIError as e:
+        st.error(
+            "SELECT projects fejlede.\n"
+            f"code={getattr(e,'code',None)} message={getattr(e,'message',None)} "
+            f"details={getattr(e,'details',None)} hint={getattr(e,'hint',None)}"
+        )
+        raise
+
     if r.data:
-        pid = r.data[0]["id"]
-        # Forsøg at opdatere channel_url/lang, men swallow fejl
+        row = r.data[0]
+        pid = row["id"]
         update = {}
-        if r.data[0].get("channel_url") != channel_url:
+        if row.get("channel_url") != channel_url:
             update["channel_url"] = channel_url
-        if (r.data[0].get("lang") or "auto") != (lang or "auto"):
+        # Opdater kun lang hvis kolonnen faktisk findes i denne række
+        if "lang" in row and (row.get("lang") or "auto") != (lang or "auto"):
             update["lang"] = lang or "auto"
 
         if update:
@@ -46,10 +57,23 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
             except APIError as e:
                 st.warning(
                     "UPDATE projects blokeret – fortsætter uden at stoppe appen.\n"
-                    f"PostgREST code={getattr(e,'code',None)} message={getattr(e,'message',None)}"
+                    f"code={getattr(e,'code',None)} message={getattr(e,'message',None)}"
                 )
-                # Prøv ikke UPSERT; vi ignorerer opdateringen og kører videre
         return pid
+
+    # INSERT – prøv med lang, og fald tilbage uden hvis schema-cache ikke kender den
+    payload = {"name": name, "channel_url": channel_url, "lang": lang or "auto"}
+    try:
+        ins = supabase.table("projects").insert(payload).execute()
+        return ins.data[0]["id"]
+    except APIError as e:
+        msg = (getattr(e, "message", "") or "").lower()
+        if "lang" in payload and ("lang" in msg or getattr(e, "code", "") == "PGRST204"):
+            st.info("Schema-cache kender ikke 'lang' endnu. Prøver INSERT uden 'lang'.")
+            payload.pop("lang", None)
+            ins = supabase.table("projects").insert(payload).execute()
+            return ins.data[0]["id"]
+        raise
 
     # Opret nyt projekt
     payload = {"name": name, "channel_url": channel_url, "lang": lang or "auto"}
