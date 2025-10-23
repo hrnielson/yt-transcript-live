@@ -30,11 +30,15 @@ oa_client = OpenAI(api_key=OPENAI_KEY)
 
 from postgrest import APIError  # sørg for import i toppen
 
+from postgrest import APIError  # sørg for at denne import findes i toppen
+
 def get_or_create_project(name: str, channel_url: str, lang: str):
-    """Return project id for name; create if missing and update channel_url/lang if changed."""
-    r = supabase.table("projects").select("*").eq("name", name).execute()
+    """Return project id for name; create if missing. Try to update fields, but never crash if RLS/schema-cache blocks."""
+    # Find existing by name
+    r = supabase.table("projects").select("id,channel_url,lang").eq("name", name).execute()
     if r.data:
         pid = r.data[0]["id"]
+        # Forsøg at opdatere channel_url/lang, men swallow fejl
         update = {}
         if r.data[0].get("channel_url") != channel_url:
             update["channel_url"] = channel_url
@@ -45,25 +49,28 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
             try:
                 supabase.table("projects").update(update).eq("id", pid).execute()
             except APIError as e:
-                msg = (getattr(e, "message", "") or "").lower()
-                code = getattr(e, "code", "")
                 st.warning(
-                    "UPDATE projects blev blokeret. Forsøger UPSERT i stedet.\n"
-                    f"PostgREST -> code: {code} | message: {getattr(e,'message',None)}"
+                    "UPDATE projects blokeret – fortsætter uden at stoppe appen.\n"
+                    f"PostgREST code={getattr(e,'code',None)} message={getattr(e,'message',None)}"
                 )
-                # Fald tilbage til UPSERT
-                row = {"id": pid, **update}
-                try:
-                    supabase.table("projects").upsert(row, on_conflict="id").execute()
-                except APIError as e2:
-                    msg2 = (getattr(e2, "message", "") or "").lower()
-                    # Hvis schema-cache ikke kender 'lang', prøv uden 'lang'
-                    if "lang" in row and ("lang" in msg2 or code == "PGRST204"):
-                        bad = row.pop("lang", None)
-                        st.info("Schema-cache kender ikke kolonnen 'lang' endnu. Prøver uden 'lang'.")
-                        supabase.table("projects").upsert(row, on_conflict="id").execute()
-                    else:
-                        raise
+                # Prøv ikke UPSERT; vi ignorerer opdateringen og kører videre
+        return pid
+
+    # Opret nyt projekt
+    payload = {"name": name, "channel_url": channel_url, "lang": lang or "auto"}
+    try:
+        ins = supabase.table("projects").insert(payload).execute()
+        return ins.data[0]["id"]
+    except APIError as e:
+        # Hvis schema-cache ikke kender 'lang', så prøv igen uden 'lang'
+        msg = (getattr(e, "message", "") or "").lower()
+        if "lang" in payload and ("lang" in msg or getattr(e, "code", "") == "PGRST204"):
+            st.info("Schema-cache kender ikke kolonnen 'lang' endnu ved INSERT. Prøver igen uden 'lang'.")
+            payload.pop("lang", None)
+            ins = supabase.table("projects").insert(payload).execute()
+            return ins.data[0]["id"]
+        # Andre fejl – bobler op så vi kan se dem i UI
+        raise
         return pid
 
     # Insert hvis ikke findes
