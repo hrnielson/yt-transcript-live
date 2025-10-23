@@ -561,22 +561,25 @@ with tab_search:
         q = st.text_input("Search term", value="hammer")
         limit = st.slider("Max results", 10, 500, 50, 10)
         if st.button("Search"):
-            try:
-                res = supabase.rpc("segments_search_by_project", {
-                    "p_project": options[sel],
-                    "p_query": q.strip(),
-                    "p_limit": int(limit),
-                }).execute()
-                rows = res.data or []
-            except APIError as e:
-                st.error(
-                    "RPC segments_search_by_project failed\n"
-                    f"code: {getattr(e,'code',None)}\n"
-                    f"message: {getattr(e,'message',None)}\n"
-                    f"details: {getattr(e,'details',None)}\n"
-                    f"hint: {getattr(e,'hint',None)}"
-                )
-                rows = []
+try:
+    res = supabase.rpc("segments_search_by_project", {
+        "p_project": options[sel],
+        "p_query": q.strip(),
+        "p_limit": int(limit),
+    }).execute()
+    rows = res.data or []
+except APIError:
+    st.warning("RPC failed — falling back to simple LIKE search (no stemming/synonyms).")
+    # Simple fallback: case-insensitive 'content ILIKE %q%'
+    rows = supabase.table("segments")\
+        .select("content,start,video_id,project_id")\
+        .eq("project_id", options[sel])\
+        .ilike("content", f"%{q.strip()}%")\
+        .limit(int(limit))\
+        .execute().data or []
+    # join på videos for title/url hvis du vil pifte det op:
+    # (kan laves med yderligere kald)
+
 
             if not rows:
                 st.info("No results.")
