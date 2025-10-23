@@ -525,10 +525,10 @@ with tab_search:
             # 1) Prøv RPC (med stemming/synonymer + relevans)
             try:
                 res = supabase.rpc("segments_search_by_project", {
+                    "p_limit": int(limit),
                     "p_project": options[sel],
                     "p_query": q.strip(),
-                    "p_limit": int(limit),
-                }).execute()
+                    }).execute()
                 rows = res.data or []
             except APIError as e:
                 # 2) Fallback: simpel ILIKE + berig med title/url
