@@ -1,12 +1,14 @@
 # app.py — YouTube Quote Finder (Cloud, OpenAI-only)
 # Streamlit + Supabase + YouTube Data API v3 + Captions-first + OpenAI Whisper
-# 2025-ready edition with robust yt-dlp fallbacks, Whisper fallback, idempotent DB upserts, and temp cleanup
-# All inline comments are in English.
+# 2025-ready edition with robust yt-dlp fallbacks, Whisper fallback, idempotent DB upserts, temp cleanup
+# One-file version with: project language, dedup (never index same video twice), and stable yt-dlp options.
 
 import re
 import shutil
 import tempfile
 from pathlib import Path
+from datetime import datetime, timezone
+
 import httpx
 import pandas as pd
 import streamlit as st
@@ -16,7 +18,6 @@ from supabase import Client, create_client
 from youtube_transcript_api import (NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi)
 
 # ---------- Secrets / Clients ----------
-# These must be configured in Streamlit secrets.
 SB_URL = st.secrets["SUPABASE_URL"]
 SB_KEY = st.secrets["SUPABASE_KEY"]
 OPENAI_KEY = st.secrets["OPENAI_API_KEY"]
@@ -49,9 +50,8 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
 
 def list_projects():
     """List existing projects (lightweight columns)."""
-    r = supabase.table("projects").select("id,name,channel_url,created_at").order("created_at", desc=True).execute()
+    r = supabase.table("projects").select("id,name,channel_url,lang,created_at").order("created_at", desc=True).execute()
     return r.data or []
-
 
 def upsert_video(project_id: str, v: dict):
     """Idempotent upsert of a video row by primary key id."""
@@ -64,6 +64,13 @@ def upsert_video(project_id: str, v: dict):
     }
     supabase.table("videos").upsert(row, on_conflict="id").execute()
 
+def is_already_indexed(project_id: str, video_id: str) -> bool:
+    """Return True if the video already has at least one segment for this project or videos.indexed_at is set."""
+    r = supabase.table("segments").select("video_id").eq("project_id", project_id).eq("video_id", video_id).limit(1).execute()
+    if r.data:
+        return True
+    r2 = supabase.table("videos").select("indexed_at").eq("id", video_id).limit(1).execute()
+    return bool(r2.data and r2.data[0].get("indexed_at"))
 
 def insert_segments(project_id: str, video_id: str, segments: list[dict], lang: str | None = None):
     """Batch upsert of segments. Requires a unique index on (project_id, video_id, start) in DB."""
@@ -86,11 +93,6 @@ def insert_segments(project_id: str, video_id: str, segments: list[dict], lang: 
     for i in range(0, len(rows), 500):
         supabase.table("segments").upsert(rows[i:i + 500], on_conflict="project_id,video_id,start").execute()
 
-def search_segments(project_id: str, q: str, limit: int = 100):
-    """Search via a Supabase RPC (SQL function) called segments_search."""
-    r = supabase.rpc("segments_search", {"p_project": project_id, "p_query": q, "p_limit": limit}).execute()
-    return r.data or []
-
 # ---------- HTTP helper ----------
 
 def _http_get(url: str, params: dict, timeout=60):
@@ -101,9 +103,7 @@ def _http_get(url: str, params: dict, timeout=60):
             r.raise_for_status()
         except httpx.HTTPStatusError as e:
             safe_params = {k: v for k, v in params.items() if k != "key"}
-            raise RuntimeError(
-                f"HTTP {e.response.status_code} on {url} with params {safe_params}"
-            ) from e
+            raise RuntimeError(f"HTTP {e.response.status_code} on {url} with params {safe_params}") from e
         return r.json()
 
 # ---------- YouTube Data API ----------
@@ -126,7 +126,6 @@ def _extract_bits(inp: str):
         return None, None, None, m.group(1)
     return None, None, None, None
 
-
 def _resolve_channel_id(handle_or_url: str) -> str:
     """Resolve channelId from @handle, channel URL, username, or a search fallback."""
     base = "https://www.googleapis.com/youtube/v3"
@@ -144,15 +143,11 @@ def _resolve_channel_id(handle_or_url: str) -> str:
         if items:
             return items[0]["id"]
     q = (handle_or_url or "").replace("https://www.youtube.com/", " ").strip()
-    data = _http_get(
-        f"{base}/search",
-        {"part": "snippet", "type": "channel", "q": q or "", "maxResults": 1, "key": YOUTUBE_API_KEY},
-    )
+    data = _http_get(f"{base}/search", {"part": "snippet", "type": "channel", "q": q or "", "maxResults": 1, "key": YOUTUBE_API_KEY})
     items = data.get("items", [])
     if items:
         return items[0]["snippet"]["channelId"]
     raise RuntimeError("Channel not found via YouTube API.")
-
 
 def list_videos_by_channel_id(channel_id: str):
     """Return a list of uploads with id/title/published_at/url for a channel."""
@@ -238,7 +233,6 @@ def preferred_langs_for(project_lang: str) -> tuple[str, ...]:
         return ("en", "da", "sv")
     return ("da", "en", "sv")  # auto fallback
 
-
 # ---------- Downloader ----------
 
 def _write_cookies_if_any(cookies_text: str) -> str | None:
@@ -251,7 +245,6 @@ def _write_cookies_if_any(cookies_text: str) -> str | None:
     if "# Netscape" not in cookies_text:
         st.caption("⚠️ cookies.txt without Netscape header – proceeding anyway.")
     return str(cookiefile)
-
 
 def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merge_to: str = "m4a") -> Path | None:
     """Attempt a single yt-dlp download with FFmpeg postprocessing to a consistent container."""
@@ -269,7 +262,7 @@ def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merg
         "concurrent_fragments": 3,
         "overwrites": True,
         "force_ipv4": True,
-        "extractor_args": {"youtube": {"player_client": ["android","web","web_safari"]}},    
+        "extractor_args": {"youtube": {"player_client": ["android", "web", "web_safari"]}},
     }
     if cookiefile:
         ytdl_opts["cookiefile"] = cookiefile
@@ -289,9 +282,8 @@ def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merg
     best = max(matches, key=lambda p: p.stat().st_size)
     return best if best.exists() and best.stat().st_size > 0 else None
 
-
 def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
-    """Download audio to a temp directory with robust format fallbacks; always returns an audio file (m4a) or raises."""
+    """Download audio to a temp directory with robust format fallbacks; returns an audio file (m4a) or raises."""
     tmpdir = Path(tempfile.mkdtemp(prefix=f"yqf_{video_id}_"))
     outtmpl = str(tmpdir / f"{video_id}.%(ext)s")
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -383,9 +375,7 @@ if "pid" not in st.session_state:
 if "resolved_channel_id" not in st.session_state:
     st.session_state.resolved_channel_id = None
 
-
 tab_idx, tab_search = st.tabs(["📦 Index", "🔎 Search"])
-
 
 def hhmmss(sec: float):
     s = int(round(sec or 0))
@@ -393,15 +383,16 @@ def hhmmss(sec: float):
     m, s = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-
 with tab_idx:
     st.subheader("Create or update a project")
     project_name = st.text_input("Project name", placeholder="Client A")
     channel_url = st.text_input("Channel handle or URL", placeholder="@brand or https://www.youtube.com/@brand")
+
     if st.button("Start indexing", type="primary", disabled=not (project_name and channel_url)):
         pid = get_or_create_project(project_name, channel_url, project_lang)
         st.session_state.pid = pid
         st.info("Fetching video list via YouTube Data API…")
+
         try:
             chan_id = (channel_id_override or "").strip()
             if chan_id:
@@ -419,6 +410,7 @@ with tab_idx:
 
         if max_videos > 0:
             videos = videos[: max_videos]
+
         if not videos:
             st.error("No videos found. Check Channel ID, handle, or visibility.")
         else:
@@ -426,9 +418,18 @@ with tab_idx:
             prog = st.progress(0, text="Indexing…")
             total = len(videos)
             done = 0
+
             for v in videos:
                 vid = v["video_id"]
                 upsert_video(pid, v)
+
+                # ⛔ Dedup: skip if already indexed for this project
+                if is_already_indexed(pid, vid):
+                    st.write(f"⏭️ Skipper allerede indekseret: {v['title']}")
+                    done += 1
+                    prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
+                    continue
+
                 st.write(f"Processing {v['title']}")
                 segs = None
                 audio_path = None
@@ -438,16 +439,25 @@ with tab_idx:
                         segs = fetch_youtube_captions(vid, preferred=preferred_langs_for(project_lang))
                         if segs:
                             insert_segments(pid, vid, segs, lang=project_lang)
+
                     # 2) Audio download + ASR
                     if not segs:
                         audio_path = download_audio_tmp(vid, cookies_text)
                         forced_lang = None if project_lang == "auto" else project_lang
                         segs = transcribe_with_openai(audio_path, forced_lang)
                         insert_segments(pid, vid, segs, lang=project_lang)
+
                     if not segs:
                         st.warning(f"No segments for {vid} (captions+ASR failed).")
+                    else:
+                        # ✅ Mark video as indexed
+                        supabase.table("videos").update({
+                            "indexed_at": datetime.now(timezone.utc).isoformat()
+                        }).eq("id", vid).execute()
+
                 except Exception as e:
                     st.warning(f"Skipped {vid}: {e}")
+
                 finally:
                     # Cleanup per-video temp dir
                     try:
@@ -456,8 +466,10 @@ with tab_idx:
                             shutil.rmtree(tmp_parent, ignore_errors=True)
                     except Exception:
                         pass
+
                 done += 1
                 prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
+
             st.success("✅ Done indexing.")
 
     st.divider()
@@ -467,7 +479,6 @@ with tab_idx:
         st.dataframe(pd.DataFrame(prjs), use_container_width=True)
     else:
         st.info("No projects yet.")
-
 
 with tab_search:
     st.subheader("Search quotes")
@@ -501,12 +512,15 @@ with tab_search:
                     "text/csv",
                 )
 
+# ---------- Diagnostics ----------
+
 def diagnose_video(video_id: str, cookies_text: str = "") -> dict:
     url = f"https://www.youtube.com/watch?v={video_id}"
     cookiefile = _write_cookies_if_any(cookies_text)
     opts = {"quiet": True, "skip_download": True, "noplaylist": True,
             "http_headers": {"User-Agent": "Mozilla/5.0"}, "force_ipv4": True}
-    if cookiefile: opts["cookiefile"] = cookiefile
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -530,8 +544,13 @@ with st.expander("Diagnostics"):
     if st.button("Run diagnostics"):
         st.json(diagnose_video(vid, cookies_text))
 
-
 # ---------- Notes ----------
-# DB requirement: ensure a unique constraint on (project_id, video_id, start) for segments to keep runs idempotent, e.g.:
-# ALTER TABLE segments ADD CONSTRAINT segments_unique UNIQUE (project_id, video_id, start);
-# Recommended for text search RPC: a GIN index on to_tsvector(content).
+# DB requirements (run in Supabase SQL editor, once):
+# 1) Ensure projects.lang and segments.lang exist; add videos.indexed_at
+#    alter table public.projects add column if not exists lang text default 'auto';
+#    alter table public.segments add column if not exists lang text;
+#    alter table public.videos   add column if not exists indexed_at timestamptz;
+# 2) Unique + performance:
+#    create unique index if not exists segments_unique on public.segments(project_id, video_id, start);
+#    create index if not exists segments_proj_vid_idx on public.segments(project_id, video_id);
+# 3) FTS indexes (optional but recommended) + RPC 'segments_search_by_project' as previously provided.
