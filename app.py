@@ -244,7 +244,7 @@ def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merg
         "geo_bypass": True,
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": merge_to, "preferredquality": "0"}],
         "merge_output_format": merge_to,
-        "concurrent_fragments": 1 if force_stability else 3,
+        "concurrent_fragments": 3,
         "overwrites": True,
         "force_ipv4": True,
         "extractor_args": {"youtube": {"player_client": ["android","web","web_safari"]}},    
