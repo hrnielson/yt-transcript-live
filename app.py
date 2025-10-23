@@ -28,6 +28,8 @@ oa_client = OpenAI(api_key=OPENAI_KEY)
 
 # ---------- Supabase helpers ----------
 
+from postgrest import APIError  # sørg for import i toppen
+
 def get_or_create_project(name: str, channel_url: str, lang: str):
     """Return project id for name; create if missing and update channel_url/lang if changed."""
     r = supabase.table("projects").select("*").eq("name", name).execute()
@@ -43,24 +45,42 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
             try:
                 supabase.table("projects").update(update).eq("id", pid).execute()
             except APIError as e:
-                # Vis den rigtige fejl i UI og fald tilbage til upsert på id
+                msg = (getattr(e, "message", "") or "").lower()
+                code = getattr(e, "code", "")
                 st.warning(
                     "UPDATE projects blev blokeret. Forsøger UPSERT i stedet.\n"
-                    f"PostgREST -> code: {getattr(e, 'code', None)} | "
-                    f"message: {getattr(e, 'message', None)} | "
-                    f"details: {getattr(e, 'details', None)} | "
-                    f"hint: {getattr(e, 'hint', None)}"
+                    f"PostgREST -> code: {code} | message: {getattr(e,'message',None)}"
                 )
+                # Fald tilbage til UPSERT
                 row = {"id": pid, **update}
-                supabase.table("projects").upsert(row, on_conflict="id").execute()
+                try:
+                    supabase.table("projects").upsert(row, on_conflict="id").execute()
+                except APIError as e2:
+                    msg2 = (getattr(e2, "message", "") or "").lower()
+                    # Hvis schema-cache ikke kender 'lang', prøv uden 'lang'
+                    if "lang" in row and ("lang" in msg2 or code == "PGRST204"):
+                        bad = row.pop("lang", None)
+                        st.info("Schema-cache kender ikke kolonnen 'lang' endnu. Prøver uden 'lang'.")
+                        supabase.table("projects").upsert(row, on_conflict="id").execute()
+                    else:
+                        raise
         return pid
 
-    ins = supabase.table("projects").insert({
-        "name": name,
-        "channel_url": channel_url,
-        "lang": lang or "auto",
-    }).execute()
+    # Insert hvis ikke findes
+    payload = {"name": name, "channel_url": channel_url, "lang": lang or "auto"}
+    try:
+        ins = supabase.table("projects").insert(payload).execute()
+    except APIError as e:
+        # Samme fallback ved stale cache på INSERT
+        msg = (getattr(e, "message", "") or "").lower()
+        if "lang" in payload and ("lang" in msg or getattr(e, "code", "") == "PGRST204"):
+            st.info("Schema-cache kender ikke kolonnen 'lang' endnu ved INSERT. Prøver uden 'lang'.")
+            payload.pop("lang", None)
+            ins = supabase.table("projects").insert(payload).execute()
+        else:
+            raise
     return ins.data[0]["id"]
+
 
 
 def list_projects():
