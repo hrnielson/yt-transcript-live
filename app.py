@@ -27,17 +27,25 @@ oa_client = OpenAI(api_key=OPENAI_KEY)
 
 # ---------- Supabase helpers ----------
 
-def get_or_create_project(name: str, channel_url: str):
-    """Return project id for name; create if missing and update channel_url if changed."""
+def get_or_create_project(name: str, channel_url: str, lang: str):
+    """Return project id for name; create if missing and update channel_url/lang if changed."""
     r = supabase.table("projects").select("*").eq("name", name).execute()
     if r.data:
         pid = r.data[0]["id"]
+        update = {}
         if r.data[0].get("channel_url") != channel_url:
-            supabase.table("projects").update({"channel_url": channel_url}).eq("id", pid).execute()
+            update["channel_url"] = channel_url
+        if (r.data[0].get("lang") or "auto") != (lang or "auto"):
+            update["lang"] = lang or "auto"
+        if update:
+            supabase.table("projects").update(update).eq("id", pid).execute()
         return pid
-    ins = supabase.table("projects").insert({"name": name, "channel_url": channel_url}).execute()
+    ins = supabase.table("projects").insert({
+        "name": name,
+        "channel_url": channel_url,
+        "lang": lang or "auto",
+    }).execute()
     return ins.data[0]["id"]
-
 
 def list_projects():
     """List existing projects (lightweight columns)."""
@@ -57,7 +65,7 @@ def upsert_video(project_id: str, v: dict):
     supabase.table("videos").upsert(row, on_conflict="id").execute()
 
 
-def insert_segments(project_id: str, video_id: str, segments: list[dict]):
+def insert_segments(project_id: str, video_id: str, segments: list[dict], lang: str | None = None):
     """Batch upsert of segments. Requires a unique index on (project_id, video_id, start) in DB."""
     if not segments:
         return
@@ -73,10 +81,10 @@ def insert_segments(project_id: str, video_id: str, segments: list[dict]):
             "duration": float(s.get("duration", 0)),
             "speaker": s.get("speaker") or None,
             "content": txt,
+            "lang": (s.get("lang") or lang or "auto"),
         })
     for i in range(0, len(rows), 500):
         supabase.table("segments").upsert(rows[i:i + 500], on_conflict="project_id,video_id,start").execute()
-
 
 def search_segments(project_id: str, q: str, limit: int = 100):
     """Search via a Supabase RPC (SQL function) called segments_search."""
@@ -217,6 +225,20 @@ def fetch_youtube_captions(video_id: str, preferred=("da", "en", "no", "sv")):
     except Exception:
         return None
 
+# ---------- Language helper ----------
+
+def preferred_langs_for(project_lang: str) -> tuple[str, ...]:
+    """Return a tuple of preferred caption languages based on the project's language."""
+    pl = (project_lang or "auto").lower()
+    if pl == "da":
+        return ("da", "no", "sv", "en")
+    if pl == "sv":
+        return ("sv", "no", "da", "en")
+    if pl == "en":
+        return ("en", "da", "sv")
+    return ("da", "en", "sv")  # auto fallback
+
+
 # ---------- Downloader ----------
 
 def _write_cookies_if_any(cookies_text: str) -> str | None:
@@ -342,7 +364,7 @@ st.title("🎬 YouTube Quote Finder")
 with st.sidebar:
     st.header("Settings")
     captions_first = st.toggle("Use captions first", value=True)
-    language = st.text_input("Language (e.g., 'da' or leave empty)", value="da")
+    project_lang = st.text_input("Channel language (da/en/sv or 'auto')", value="da").strip().lower() or "auto"
     max_videos = st.number_input("Limit videos (0 = all)", 0, 5000, 0)
     channel_id_override = st.text_input(
         "Channel ID override (optional, starts with 'UC')",
@@ -377,7 +399,7 @@ with tab_idx:
     project_name = st.text_input("Project name", placeholder="Client A")
     channel_url = st.text_input("Channel handle or URL", placeholder="@brand or https://www.youtube.com/@brand")
     if st.button("Start indexing", type="primary", disabled=not (project_name and channel_url)):
-        pid = get_or_create_project(project_name, channel_url)
+        pid = get_or_create_project(project_name, channel_url, project_lang)
         st.session_state.pid = pid
         st.info("Fetching video list via YouTube Data API…")
         try:
@@ -413,14 +435,15 @@ with tab_idx:
                 try:
                     # 1) Captions-first
                     if captions_first:
-                        segs = fetch_youtube_captions(vid)
+                        segs = fetch_youtube_captions(vid, preferred=preferred_langs_for(project_lang))
                         if segs:
-                            insert_segments(pid, vid, segs)
+                            insert_segments(pid, vid, segs, lang=project_lang)
                     # 2) Audio download + ASR
                     if not segs:
                         audio_path = download_audio_tmp(vid, cookies_text)
-                        segs = transcribe_with_openai(audio_path, (language or "").split("-")[0].strip() or None)
-                        insert_segments(pid, vid, segs)
+                        forced_lang = None if project_lang == "auto" else project_lang
+                        segs = transcribe_with_openai(audio_path, forced_lang)
+                        insert_segments(pid, vid, segs, lang=project_lang)
                     if not segs:
                         st.warning(f"No segments for {vid} (captions+ASR failed).")
                 except Exception as e:
@@ -457,7 +480,11 @@ with tab_search:
         q = st.text_input("Search term", value="hammer")
         limit = st.slider("Max results", 10, 500, 50, 10)
         if st.button("Search"):
-            rows = search_segments(options[sel], q.strip(), limit)
+            rows = supabase.rpc("segments_search_by_project", {
+                "p_project": options[sel],
+                "p_query": q.strip(),
+                "p_limit": int(limit),
+            }).execute().data or []
             if not rows:
                 st.info("No results.")
             else:
