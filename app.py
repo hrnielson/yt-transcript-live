@@ -27,11 +27,6 @@ supabase: Client = create_client(SB_URL, SB_KEY)
 oa_client = OpenAI(api_key=OPENAI_KEY)
 
 # ---------- Supabase helpers ----------
-
-from postgrest import APIError  # sørg for import i toppen
-
-from postgrest import APIError  # sørg for at denne import findes i toppen
-
 def get_or_create_project(name: str, channel_url: str, lang: str):
     """Return project id for name; create if missing. Try to update fields, but never crash if RLS/schema-cache blocks."""
     # Find existing by name
