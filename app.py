@@ -561,11 +561,23 @@ with tab_search:
         q = st.text_input("Search term", value="hammer")
         limit = st.slider("Max results", 10, 500, 50, 10)
         if st.button("Search"):
-            rows = supabase.rpc("segments_search_by_project", {
-                "p_project": options[sel],
-                "p_query": q.strip(),
-                "p_limit": int(limit),
-            }).execute().data or []
+            try:
+                res = supabase.rpc("segments_search_by_project", {
+                    "p_project": options[sel],
+                    "p_query": q.strip(),
+                    "p_limit": int(limit),
+                }).execute()
+                rows = res.data or []
+            except APIError as e:
+                st.error(
+                    "RPC segments_search_by_project failed\n"
+                    f"code: {getattr(e,'code',None)}\n"
+                    f"message: {getattr(e,'message',None)}\n"
+                    f"details: {getattr(e,'details',None)}\n"
+                    f"hint: {getattr(e,'hint',None)}"
+                )
+                rows = []
+
             if not rows:
                 st.info("No results.")
             else:
