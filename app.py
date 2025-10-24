@@ -173,33 +173,39 @@ def extract_quotes_from_video(project_id: str, video_id: str, lang_hint: str, so
     attribution = get_project_display_name(project_id)
     total_inserted = 0
 
-    def backfill_quotes_for_project(project_id: str, lang_hint: str):
+def backfill_quotes_for_project(project_id: str, lang_hint: str) -> tuple[int, int]:
     """Lav citater for alle videoer i projektet, hvor der ikke findes quotes endnu."""
-    # Hent alle video-ids i projektet
     vids = supabase.table("videos").select("id").eq("project_id", project_id).execute().data or []
     processed, created = 0, 0
+
     for v in vids:
         vid = v["id"]
+
         # Findes der allerede mindst ét quote for denne video?
-        existing = supabase.table("quotes").select("id", count="exact")\
-                    .eq("project_id", project_id).eq("video_id", vid).limit(1).execute()
-        has_quotes = bool(getattr(existing, "count", 0))
+        qres = supabase.table("quotes").select("id", count="exact") \
+            .eq("project_id", project_id).eq("video_id", vid).limit(1).execute()
+        has_quotes = bool(getattr(qres, "count", 0))
+
         if has_quotes:
             continue
 
         # Er der segments at arbejde med?
-        segs_exist = supabase.table("segments").select("video_id", count="exact")\
-                        .eq("project_id", project_id).eq("video_id", vid).limit(1).execute()
-        if not bool(getattr(segs_exist, "count", 0)):
+        sres = supabase.table("segments").select("video_id", count="exact") \
+            .eq("project_id", project_id).eq("video_id", vid).limit(1).execute()
+        has_segments = bool(getattr(sres, "count", 0))
+
+        if not has_segments:
             continue
 
-        # Uddrag citater ud fra segments
+        # Uddrag citater ud fra eksisterende segments
         try:
             new_cnt = extract_quotes_from_video(project_id, vid, lang_hint, source="backfill")
             created += int(new_cnt or 0)
             processed += 1
         except Exception as e:
             st.caption(f"Backfill for {vid} skipped: {e}")
+            continue
+
     return processed, created
 
     
