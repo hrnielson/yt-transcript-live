@@ -747,6 +747,7 @@ with tab_idx:
                 done = 0
 
             for v in videos:
+                video_id = v["video_id"]  # <-- definer id her
                 ok, new_quotes = index_one_video_with_progress(
                     pid=pid,
                     v=v,
