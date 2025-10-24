@@ -574,8 +574,6 @@ def download_audio_tmp(video_id: str, cookies_text: str = "", on_event=None) -> 
             pass
         raise
 
-
-
 # ---------- OpenAI Whisper (fallback chain) ----------
 
 def transcribe_with_openai(file_path: Path, language: str | None):
@@ -637,7 +635,6 @@ if "pid" not in st.session_state:
 if "resolved_channel_id" not in st.session_state:
     st.session_state.resolved_channel_id = None
 
-
 tab_idx, tab_search = st.tabs(["📦 Index Videos", "💬 Find Quotes"])
 
 def hhmmss(sec: float):
@@ -646,10 +643,7 @@ def hhmmss(sec: float):
     m, s = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-
-# --- Index tab ---
-
-import time
+# ---------- Batch UI ----------
 
 class BatchUI:
     def __init__(self, total: int):
@@ -698,6 +692,7 @@ class BatchUI:
         msg = "✅ Indexing finished" if success else "❌ Indexing finished with errors"
         self.stage_ph.success(f"{msg}  •  {self.done}/{self.total}")
 
+# ---------- Index helper ----------
 
 def index_one_video_batch(
     ui: BatchUI,
@@ -783,18 +778,25 @@ def index_one_video_batch(
             pass
         ui.advance()
 
+# ---------- Tabs ----------
 
 with tab_idx:
     try:
         st.subheader("Create or update a project")
         project_name = st.text_input("Project name", placeholder="Client A", key="proj_name")
-        channel_url = st.text_input("Channel handle or URL", placeholder="@brand or https://www.youtube.com/@brand", key="chan_url")
+        channel_url = st.text_input(
+            "Channel handle or URL",
+            placeholder="@brand or https://www.youtube.com/@brand",
+            key="chan_url",
+        )
 
         if st.button("Start indexing", type="primary", disabled=not (project_name and channel_url), key="start_idx"):
+            # 1) Opret/lookup projekt
             pid = get_or_create_project(project_name, channel_url, project_lang)
             st.session_state.pid = pid
             st.info("Fetching video list via YouTube Data API…")
 
+            # 2) Hent videoer
             try:
                 chan_id = (channel_id_override or "").strip()
                 if chan_id:
@@ -810,28 +812,26 @@ with tab_idx:
                 st.error(f"Could not list videos: {e}")
                 videos = []
 
+            # 3) Begræns evt.
             if max_videos > 0:
                 videos = videos[: max_videos]
 
+            # 4) Kør batchen
             if not videos:
                 st.error("No videos found. Check Channel ID, handle, or visibility.")
-    else:
-        st.success(f"Found {len(videos)} videos.")
-
-        # ✅ Kun BatchUI håndterer progress nu
-        ui = BatchUI(total=len(videos))
-
-        for v in videos:
-            index_one_video_batch(
-                ui=ui,
-                pid=pid,
-                v=v,
-                captions_first=captions_first,
-                project_lang=project_lang,
-                cookies_text=cookies_text,
-            )
-
-        ui.finish()
+            else:
+                st.success(f"Found {len(videos)} videos.")
+                ui = BatchUI(total=len(videos))  # ÉN samlet status/progress
+                for v in videos:
+                    index_one_video_batch(
+                        ui=ui,
+                        pid=pid,
+                        v=v,
+                        captions_first=captions_first,
+                        project_lang=project_lang,
+                        cookies_text=cookies_text,
+                    )
+                ui.finish(success=True)
 
         st.divider()
         st.subheader("Existing projects")
@@ -843,7 +843,6 @@ with tab_idx:
 
     except Exception as e:
         st.exception(e)
-
 
 # --- Search tab ---
 with tab_search:
@@ -961,9 +960,6 @@ with tab_search:
                 if search_mode == "Segments":
                     cols = [c for c in ("title", "content", "timestamp", "url") if c in df.columns]
                     df = df[cols].rename(columns={"content": "quote"})
-                else:
-                    # quotes
-                    pass
                 st.dataframe(df, use_container_width=True)
                 st.download_button(
                     "Download CSV",
