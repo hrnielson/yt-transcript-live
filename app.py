@@ -538,7 +538,7 @@ def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merg
 
 
 def download_audio_tmp(video_id: str, cookies_text: str = "", on_event=None) -> Path:
-    """Download audio to a temp directory with robust format fallbacks; returns an audio file (m4a) or raises."""
+    """Download audio til temp med robuste format-fallbacks; returnerer sti til fil (m4a) eller kaster."""
     tmpdir = Path(tempfile.mkdtemp(prefix=f"yqf_{video_id}_"))
     outtmpl = str(tmpdir / f"{video_id}.%(ext)s")
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -552,18 +552,20 @@ def download_audio_tmp(video_id: str, cookies_text: str = "", on_event=None) -> 
         "best",
     ]
 
+    if on_event:
+        on_event("🔍 Analyserer mulige download-formater (yt-dlp)…")
+
     try:
-        if on_event:
-            on_event("Analyzing possible download formats …")
         for fmt in fmt_list:
-            p = _try_download(url, outtmpl, fmt, cookiefile, on_event=on_event)
+            if on_event:
+                on_event(f"⤵️ Forsøger download i format: {fmt}")
+            p = _try_download(url, outtmpl, fmt, cookiefile)
             if p:
+                if on_event:
+                    on_event(f"✅ Download OK ({p.suffix.lstrip('.')}, {p.stat().st_size // 1024} KB)")
                 return p
         raise RuntimeError("No available format could be downloaded (all strategies failed)")
-    except Exception as e:
-        if on_event:
-            on_event(f"Download failed: {e}")
-        # Cleanup temp dirs if we fail entirely
+    except Exception:
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
             if cookiefile:
@@ -571,6 +573,7 @@ def download_audio_tmp(video_id: str, cookies_text: str = "", on_event=None) -> 
         except Exception:
             pass
         raise
+
 
 
 # ---------- OpenAI Whisper (fallback chain) ----------
@@ -642,71 +645,107 @@ def hhmmss(sec: float):
     m, s = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+
 # --- Index tab ---
-def index_one_video_with_progress(pid: str, v: dict, captions_first: bool, project_lang: str, cookies_text: str):
-    """Index a single video with a visible step-by-step status panel. Returns (ok: bool, created_quotes: int)."""
+class BatchUI:
+    """Én samlet statusboks + en ekspander med detaljeret log."""
+    def __init__(self, total: int):
+        self.total = total
+        self.done = 0
+        self.ok = 0
+        self.quotes = 0
+        self.status = st.status(f"📦 Indekserer… 0/{total}", expanded=True)
+        self.expander = st.expander("Indexing details", expanded=False)
+        self.detail_area = self.expander.empty()
+        self.logs: list[str] = []
+
+    def log(self, line: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.logs.append(f"[{ts}] {line}")
+        # Rendér hele loggen som monospace
+        self.detail_area.code("\n".join(self.logs), language="text")
+
+    def step_label(self, extra=""):
+        self.status.update(label=f"📦 Indekserer… {self.done}/{self.total} {extra}".strip())
+
+    def mark_done(self, success: bool, quotes: int):
+        self.done += 1
+        self.ok += 1 if success else 0
+        self.quotes += quotes
+        self.step_label()
+
+    def finish(self):
+        # Samlende slutstatus
+        lbl = f"✅ Færdig: {self.ok}/{self.total} OK — {self.quotes} nye citater"
+        self.status.update(label=lbl, state="complete")
+
+
+def index_one_video_batch(ui: BatchUI, pid: str, v: dict, captions_first: bool, project_lang: str, cookies_text: str):
+    """Indekserer én video og logger trinvis status i en samlet statusboks."""
     vid = v["video_id"]
     title = v.get("title") or vid
-    created_quotes = 0
     segs = None
     audio_path = None
+    created_quotes = 0
 
-    with st.status(f"🔎 Processing: {title}", expanded=True) as status:
-        try:
-            # Dedup
-            if is_already_indexed(pid, vid):
-                status.update(label=f"⏭️ Skipping (already indexed): {title}", state="complete")
-                return True, 0
+    ui.log(f"🎥 {title} ({vid})")
 
-            # 1) Captions-first
-            if captions_first:
-                status.write("📝 Fetching captions (preferred languages)…")
-                segs = fetch_youtube_captions(vid, preferred=preferred_langs_for(project_lang))
-                if segs:
-                    status.write(f"✅ Captions found: {len(segs)} segments")
-                    insert_segments(pid, vid, segs, lang=project_lang)
-                else:
-                    status.write("ℹ️ No captions found in preferred languages.")
+    try:
+        # Dedup
+        if is_already_indexed(pid, vid):
+            ui.log("  ⏭️ Skipper (allerede indekseret)")
+            ui.mark_done(success=True, quotes=0)
+            return
 
-            # 2) Download + ASR
-            if not segs:
-                status.write("⤵️ Downloading audio (yt-dlp fallbacks)…")
-                audio_path = download_audio_tmp(vid, cookies_text, on_event=status.write)
-                status.write("🗣️ Transcribing audio (OpenAI)…")
-                forced_lang = None if project_lang == "auto" else project_lang
-                segs = transcribe_with_openai(audio_path, forced_lang)
-                status.write(f"✅ Transcription done: {len(segs)} segments")
+        # 1) Captions-first
+        if captions_first:
+            ui.log("  📝 Henter captions i foretrukne sprog…")
+            segs = fetch_youtube_captions(vid, preferred=preferred_langs_for(project_lang))
+            if segs:
+                ui.log(f"  ✅ Captions fundet: {len(segs)} segmenter")
                 insert_segments(pid, vid, segs, lang=project_lang)
+            else:
+                ui.log("  ℹ️ Ingen egnede captions fundet.")
 
-            if not segs:
-                status.update(label=f"❌ No segments available: {title}", state="error")
-                return False, 0
+        # 2) Download + ASR
+        if not segs:
+            ui.log("  ⤵️ Downloader lyd…")
+            audio_path = download_audio_tmp(vid, cookies_text, on_event=lambda m: ui.log("    " + m))
+            ui.log("  🗣️ Transskriberer lyd (OpenAI)…")
+            forced_lang = None if project_lang == "auto" else project_lang
+            segs = transcribe_with_openai(audio_path, forced_lang)
+            ui.log(f"  ✅ Transskription OK: {len(segs)} segmenter")
+            insert_segments(pid, vid, segs, lang=project_lang)
 
-            # 3) Mark indexed
-            status.write("🧾 Marking video as indexed …")
-            supabase.table("videos").update({
-                "indexed_at": datetime.now(timezone.utc).isoformat()
-            }).eq("id", vid).execute()
+        if not segs:
+            ui.log("  ❌ Ingen segmenter — stopper for denne video.")
+            ui.mark_done(success=False, quotes=0)
+            return
 
-            # 4) Generate quotes
-            status.write("💡 Analyzing transcript & generating publish-ready quotes …")
-            created_quotes = extract_quotes_from_video(pid, vid, project_lang, source=("captions" if captions_first else "asr"))
-            status.write(f"🧩 Quotes created: {created_quotes}")
+        # 3) Markér som indekseret
+        supabase.table("videos").update({
+            "indexed_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", vid).execute()
+        ui.log("  🧾 Markeret som indekseret.")
 
-            status.update(label=f"✅ Finished: {title}", state="complete")
-            return True, created_quotes
+        # 4) Generér citater
+        ui.log("  💡 Analyserer transskription og genererer citater…")
+        created_quotes = extract_quotes_from_video(pid, vid, project_lang, source=("captions" if captions_first else "asr"))
+        ui.log(f"  🧩 Nye citater: {created_quotes}")
 
-        except Exception as e:
-            status.update(label=f"❌ Failed: {title}", state="error")
-            status.write(f"Reason: {e}")
-            return False, 0
+        ui.mark_done(success=True, quotes=created_quotes)
 
-        finally:
-            try:
-                if audio_path and isinstance(audio_path, Path):
-                    shutil.rmtree(audio_path.parent, ignore_errors=True)
-            except Exception:
-                pass
+    except Exception as e:
+        ui.log(f"  ❌ Fejl: {e}")
+        ui.mark_done(success=False, quotes=0)
+
+    finally:
+        try:
+            if audio_path and isinstance(audio_path, Path):
+                shutil.rmtree(audio_path.parent, ignore_errors=True)
+        except Exception:
+            pass
+
 
 
 with tab_idx:
@@ -746,17 +785,24 @@ with tab_idx:
                 total = len(videos)
                 done = 0
 
-            for v in videos:
-                video_id = v["video_id"]  # <-- definer id her
-                ok, new_quotes = index_one_video_with_progress(
-                    pid=pid,
-                    v=v,
-                    captions_first=captions_first,
-                    project_lang=project_lang,
-                    cookies_text=cookies_text,
-                )
-                done += 1
-                prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
+# Én samlet statusboks for hele batchen
+ui = BatchUI(total=len(videos))
+
+for v in videos:
+    index_one_video_batch(
+        ui=ui,
+        pid=pid,
+        v=v,
+        captions_first=captions_first,
+        project_lang=project_lang,
+        cookies_text=cookies_text,
+    )
+    # opdater også den klassiske progressbar, hvis du vil beholde den
+    done += 1
+    prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
+
+# Slutbesked
+ui.finish()
 
 
         st.divider()
