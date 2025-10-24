@@ -647,162 +647,59 @@ def hhmmss(sec: float):
 
 
 # --- Index tab ---
-class BatchUI:
-    """Én samlet statusboks + en ekspander med detaljeret log."""
-    def __init__(self, total: int):
-        self.total = total
-        self.done = 0
-        self.ok = 0
-        self.quotes = 0
-        self.status = st.status(f"📦 Indekserer… 0/{total}", expanded=True)
-        self.expander = st.expander("Indexing details", expanded=False)
-        self.detail_area = self.expander.empty()
-        self.logs: list[str] = []
-
-    def log(self, line: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.logs.append(f"[{ts}] {line}")
-        # Rendér hele loggen som monospace
-        self.detail_area.code("\n".join(self.logs), language="text")
-
-    def step_label(self, extra=""):
-        self.status.update(label=f"📦 Indekserer… {self.done}/{self.total} {extra}".strip())
-
-    def mark_done(self, success: bool, quotes: int):
-        self.done += 1
-        self.ok += 1 if success else 0
-        self.quotes += quotes
-        self.step_label()
-
-    def finish(self):
-        # Samlende slutstatus
-        lbl = f"✅ Færdig: {self.ok}/{self.total} OK — {self.quotes} nye citater"
-        self.status.update(label=lbl, state="complete")
-
-
-def index_one_video_batch(ui: BatchUI, pid: str, v: dict, captions_first: bool, project_lang: str, cookies_text: str):
-    """Indekserer én video og logger trinvis status i en samlet statusboks."""
-    vid = v["video_id"]
-    title = v.get("title") or vid
-    segs = None
-    audio_path = None
-    created_quotes = 0
-
-    ui.log(f"🎥 {title} ({vid})")
-
-    try:
-        # Dedup
-        if is_already_indexed(pid, vid):
-            ui.log("  ⏭️ Skipper (allerede indekseret)")
-            ui.mark_done(success=True, quotes=0)
-            return
-
-        # 1) Captions-first
-        if captions_first:
-            ui.log("  📝 Henter captions i foretrukne sprog…")
-            segs = fetch_youtube_captions(vid, preferred=preferred_langs_for(project_lang))
-            if segs:
-                ui.log(f"  ✅ Captions fundet: {len(segs)} segmenter")
-                insert_segments(pid, vid, segs, lang=project_lang)
-            else:
-                ui.log("  ℹ️ Ingen egnede captions fundet.")
-
-        # 2) Download + ASR
-        if not segs:
-            ui.log("  ⤵️ Downloader lyd…")
-            audio_path = download_audio_tmp(vid, cookies_text, on_event=lambda m: ui.log("    " + m))
-            ui.log("  🗣️ Transskriberer lyd (OpenAI)…")
-            forced_lang = None if project_lang == "auto" else project_lang
-            segs = transcribe_with_openai(audio_path, forced_lang)
-            ui.log(f"  ✅ Transskription OK: {len(segs)} segmenter")
-            insert_segments(pid, vid, segs, lang=project_lang)
-
-        if not segs:
-            ui.log("  ❌ Ingen segmenter — stopper for denne video.")
-            ui.mark_done(success=False, quotes=0)
-            return
-
-        # 3) Markér som indekseret
-        supabase.table("videos").update({
-            "indexed_at": datetime.now(timezone.utc).isoformat()
-        }).eq("id", vid).execute()
-        ui.log("  🧾 Markeret som indekseret.")
-
-        # 4) Generér citater
-        ui.log("  💡 Analyserer transskription og genererer citater…")
-        created_quotes = extract_quotes_from_video(pid, vid, project_lang, source=("captions" if captions_first else "asr"))
-        ui.log(f"  🧩 Nye citater: {created_quotes}")
-
-        ui.mark_done(success=True, quotes=created_quotes)
-
-    except Exception as e:
-        ui.log(f"  ❌ Fejl: {e}")
-        ui.mark_done(success=False, quotes=0)
-
-    finally:
-        try:
-            if audio_path and isinstance(audio_path, Path):
-                shutil.rmtree(audio_path.parent, ignore_errors=True)
-        except Exception:
-            pass
-
-
-
 with tab_idx:
     try:
         st.subheader("Create or update a project")
         project_name = st.text_input("Project name", placeholder="Client A", key="proj_name")
         channel_url = st.text_input("Channel handle or URL", placeholder="@brand or https://www.youtube.com/@brand", key="chan_url")
 
-if st.button("Start indexing", type="primary", disabled=not (project_name and channel_url), key="start_idx"):
-    pid = get_or_create_project(project_name, channel_url, project_lang)
-    st.session_state.pid = pid
-    st.info("Fetching video list via YouTube Data API…")
+        if st.button("Start indexing", type="primary", disabled=not (project_name and channel_url), key="start_idx"):
+            pid = get_or_create_project(project_name, channel_url, project_lang)
+            st.session_state.pid = pid
+            st.info("Fetching video list via YouTube Data API…")
 
-    try:
-        chan_id = (channel_id_override or "").strip()
-        if chan_id:
-            st.success(f"Using provided Channel ID: {chan_id}")
-            videos = list_videos_by_channel_id(chan_id)
-            st.session_state.resolved_channel_id = chan_id
-        else:
-            cid = _resolve_channel_id(channel_url)
-            st.info(f"Resolved Channel ID: {cid}")
-            videos = list_videos_by_channel_id(cid)
-            st.session_state.resolved_channel_id = cid
-    except Exception as e:
-        st.error(f"Could not list videos: {e}")
-        videos = []
+            try:
+                chan_id = (channel_id_override or "").strip()
+                if chan_id:
+                    st.success(f"Using provided Channel ID: {chan_id}")
+                    videos = list_videos_by_channel_id(chan_id)
+                    st.session_state.resolved_channel_id = chan_id
+                else:
+                    cid = _resolve_channel_id(channel_url)
+                    st.info(f"Resolved Channel ID: {cid}")
+                    videos = list_videos_by_channel_id(cid)
+                    st.session_state.resolved_channel_id = cid
+            except Exception as e:
+                st.error(f"Could not list videos: {e}")
+                videos = []
 
-    if max_videos > 0:
-        videos = videos[: max_videos]
+            if max_videos > 0:
+                videos = videos[: max_videos]
 
-    if not videos:
-        st.error("No videos found. Check Channel ID, handle, or visibility.")
-    else:
-        st.success(f"Found {len(videos)} videos.")
-        prog = st.progress(0, text="Indexing…")
-        total = len(videos)
-        done = 0
+            if not videos:
+                st.error("No videos found. Check Channel ID, handle, or visibility.")
+            else:
+                st.success(f"Found {len(videos)} videos.")
+                prog = st.progress(0, text="Indexing…")
+                total = len(videos)
+                done = 0
 
-        # ✅ Her starter batchen
-        ui = BatchUI(total=len(videos))
+                # ✅ Ny statusboks
+                ui = BatchUI(total=len(videos))
 
-        for v in videos:
-            index_one_video_batch(
-                ui=ui,
-                pid=pid,
-                v=v,
-                captions_first=captions_first,
-                project_lang=project_lang,
-                cookies_text=cookies_text,
-            )
-            done += 1
-            prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
+                for v in videos:
+                    index_one_video_batch(
+                        ui=ui,
+                        pid=pid,
+                        v=v,
+                        captions_first=captions_first,
+                        project_lang=project_lang,
+                        cookies_text=cookies_text,
+                    )
+                    done += 1
+                    prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
 
-        ui.finish()
-
-
+                ui.finish()
 
         st.divider()
         st.subheader("Existing projects")
@@ -812,18 +709,9 @@ if st.button("Start indexing", type="primary", disabled=not (project_name and ch
         else:
             st.info("No projects yet.")
 
-        st.subheader("Backfill quotes")
-        prjs_bf = prjs or list_projects()
-        if prjs_bf:
-            options_bf = {p["name"]: p["id"] for p in prjs_bf}
-            sel_bf = st.selectbox("Project to backfill", list(options_bf.keys()), key="bf_proj")
-            if st.button("Generate missing quotes for this project", key="bf_btn"):
-                proc, made = backfill_quotes_for_project(options_bf[sel_bf], project_lang)
-                st.success(f"Backfill done: processed {proc} videos, created {made} new quotes.")
-        else:
-            st.info("No projects to backfill yet.")
     except Exception as e:
         st.exception(e)
+
 
 # --- Search tab ---
 with tab_search:
