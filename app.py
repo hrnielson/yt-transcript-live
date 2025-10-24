@@ -637,6 +637,7 @@ if "pid" not in st.session_state:
 if "resolved_channel_id" not in st.session_state:
     st.session_state.resolved_channel_id = None
 
+
 tab_idx, tab_search = st.tabs(["📦 Index Videos", "💬 Find Quotes"])
 
 def hhmmss(sec: float):
@@ -647,6 +648,122 @@ def hhmmss(sec: float):
 
 
 # --- Index tab ---
+
+import time
+
+class BatchUI:
+    def __init__(self, total: int):
+        self.total = total
+        self.done = 0
+        self.stage_ph = st.empty()     # stor statuslinje (hvad sker der nu)
+        self.sub_ph = st.empty()       # evt. undertekst
+        self.progress = st.progress(0) # samlet fremdrift
+        self._lines = []
+        self.details = st.expander("Indexing details", expanded=False)  # fold-ud log
+        self.log_box = self.details.empty()
+
+    def set_stage(self, text: str):
+        self.stage_ph.info(text)
+
+    def set_sub(self, text: str):
+        self.sub_ph.write(text)
+
+    def advance(self):
+        self.done += 1
+        pct = int(self.done / max(1, self.total) * 100)
+        self.progress.progress(pct)
+
+    def log(self, text: str, icon="ℹ️"):
+        self._lines.append(f"{icon} {text}")
+        self.log_box.markdown("\n".join(self._lines))
+
+    def ok(self, text: str):   self.log(text, "✅")
+    def warn(self, text: str): self.log(text, "⚠️")
+    def fail(self, text: str): self.log(text, "❌")
+
+    def finish(self, success: bool = True):
+        msg = "✅ Indexing finished" if success else "❌ Indexing finished with errors"
+        self.stage_ph.success(msg)
+
+def index_one_video_batch(
+    ui: BatchUI,
+    pid: str,
+    v: dict,
+    captions_first: bool,
+    project_lang: str,
+    cookies_text: str,
+):
+    """Indekser én video med trinvis status og detaljeret log."""
+    title = v.get("title") or v.get("url") or v["video_id"]
+    vid = v["video_id"]
+
+    ui.set_stage(f"Preparing: {title}")
+    ui.log(f"Video ID: {vid}")
+
+    # Dedup
+    if is_already_indexed(pid, vid):
+        ui.ok(f"Skipping (already indexed): {title}")
+        ui.advance()
+        return
+
+    segs = None
+    audio_path = None
+
+    try:
+        # 1) Captions-first
+        if captions_first:
+            ui.set_stage("Checking captions")
+            segs = fetch_youtube_captions(vid, preferred=preferred_langs_for(project_lang))
+            if segs:
+                insert_segments(pid, vid, segs, lang=project_lang)
+                ui.ok(f"Inserted {len(segs)} caption segments")
+            else:
+                ui.warn("No captions found or not usable")
+
+        # 2) Download + transcribe
+        if not segs:
+            ui.set_stage("Analyzing possible download formats")
+            ui.set_sub("Trying m4a/opus and bestaudio fallbacks")
+            ui.log("Starting yt-dlp…")
+
+            audio_path = download_audio_tmp(vid, cookies_text)
+            ui.ok(f"Downloading sound: {audio_path.name}")
+
+            ui.set_stage("Transcribing sound")
+            forced_lang = None if project_lang == "auto" else project_lang
+            segs = transcribe_with_openai(audio_path, forced_lang)
+            insert_segments(pid, vid, segs, lang=project_lang)
+            ui.ok(f"Inserted {len(segs)} ASR segments")
+
+        # 3) Markér indekseret + generér citater
+        if not segs:
+            ui.warn("No segments found (captions + ASR failed).")
+        else:
+            supabase.table("videos").update({
+                "indexed_at": datetime.now(timezone.utc).isoformat()
+            }).eq("id", vid).execute()
+
+            ui.set_stage("Analyzing transcript")
+            created = extract_quotes_from_video(
+                project_id=pid,
+                video_id=vid,
+                lang_hint=project_lang,
+                source=("captions" if captions_first else "asr"),
+            )
+            ui.ok(f"Generating quotes: {created} new quotes")
+
+    except Exception as e:
+        ui.fail(f"{title}: {e}")
+
+    finally:
+        try:
+            if audio_path and isinstance(audio_path, Path):
+                shutil.rmtree(audio_path.parent, ignore_errors=True)
+        except Exception:
+            pass
+        ui.advance()
+
+
 with tab_idx:
     try:
         st.subheader("Create or update a project")
