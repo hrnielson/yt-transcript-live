@@ -1,6 +1,6 @@
 # app.py — YouTube Quote Finder (Cloud, OpenAI-only)
 # Streamlit + Supabase + YouTube Data API v3 + Captions-first + OpenAI Whisper
-# One-file version with: project language, dedup, robust yt-dlp, defensive Supabase, RPC search + fallback, quote extraction.
+# One-file: project language, dedup, robust yt-dlp, RPC search + fallback, AI quote extraction + backfill.
 
 import re
 import json
@@ -9,18 +9,18 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 
-from postgrest import APIError
 import httpx
 import pandas as pd
 import streamlit as st
 import yt_dlp
+from postgrest import APIError
 from openai import OpenAI
 from supabase import Client, create_client
-from youtube_transcript_api import (NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi)
-
-# ---------- Streamlit page ----------
-st.set_page_config(page_title="YouTube Quote Finder", layout="wide")
-st.title("🎬 YouTube Quote Finder")
+from youtube_transcript_api import (
+    NoTranscriptFound,
+    TranscriptsDisabled,
+    YouTubeTranscriptApi,
+)
 
 # ---------- Secrets / Clients ----------
 SB_URL = st.secrets["SUPABASE_URL"]
@@ -32,12 +32,13 @@ supabase: Client = create_client(SB_URL, SB_KEY)
 oa_client = OpenAI(api_key=OPENAI_KEY)
 
 # ---------- Supabase helpers ----------
+
 def get_or_create_project(name: str, channel_url: str, lang: str):
-    """Create-or-update uden at crashe ved RLS/schema-cache issues."""
+    """Create-or-update project defensively (handles schema cache / RLS quirks)."""
     try:
         r = supabase.table("projects").select("*").eq("name", name).execute()
     except APIError as e:
-        st.error(f"SELECT projects fejlede: {e}")
+        st.error(f"SELECT projects failed: {e}")
         raise
 
     if r.data:
@@ -52,23 +53,24 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
             try:
                 supabase.table("projects").update(update).eq("id", pid).execute()
             except APIError as e:
-                st.warning(f"UPDATE projects blokeret: {e}")
+                st.warning(f"UPDATE projects blocked: {e}")
         return pid
 
-    # INSERT
     payload = {"name": name, "channel_url": channel_url, "lang": lang or "auto"}
     try:
         ins = supabase.table("projects").insert(payload).execute()
         return ins.data[0]["id"]
-    except APIError as e:
-        # Stale schema cache: prøv uden lang
+    except APIError:
+        # schema cache may not know 'lang' yet — try without
         payload.pop("lang", None)
         ins = supabase.table("projects").insert(payload).execute()
         return ins.data[0]["id"]
 
+
 def list_projects():
     r = supabase.table("projects").select("*").order("name", desc=False).execute()
     return r.data or []
+
 
 def upsert_video(project_id: str, v: dict):
     """Idempotent upsert of a video row by primary key id."""
@@ -81,16 +83,31 @@ def upsert_video(project_id: str, v: dict):
     }
     supabase.table("videos").upsert(row, on_conflict="id").execute()
 
+
 def is_already_indexed(project_id: str, video_id: str) -> bool:
-    """True hvis videoen allerede har mindst ét segment for projektet eller videos.indexed_at er sat."""
-    r = supabase.table("segments").select("video_id").eq("project_id", project_id).eq("video_id", video_id).limit(1).execute()
+    """True if video already has segments or videos.indexed_at is set."""
+    r = (
+        supabase.table("segments")
+        .select("video_id")
+        .eq("project_id", project_id)
+        .eq("video_id", video_id)
+        .limit(1)
+        .execute()
+    )
     if r.data:
         return True
-    r2 = supabase.table("videos").select("indexed_at").eq("id", video_id).limit(1).execute()
+    r2 = (
+        supabase.table("videos")
+        .select("indexed_at")
+        .eq("id", video_id)
+        .limit(1)
+        .execute()
+    )
     return bool(r2.data and r2.data[0].get("indexed_at"))
 
+
 def insert_segments(project_id: str, video_id: str, segments: list[dict], lang: str | None = None):
-    """Batch upsert of segments."""
+    """Batch upsert of segments. Unique index on (project_id, video_id, start) recommended."""
     if not segments:
         return
     rows = []
@@ -98,19 +115,22 @@ def insert_segments(project_id: str, video_id: str, segments: list[dict], lang: 
         txt = (s.get("text") or s.get("content") or "").strip()
         if not txt:
             continue
-        rows.append({
-            "project_id": project_id,
-            "video_id": video_id,
-            "start": float(s.get("start", 0)),
-            "duration": float(s.get("duration", 0)),
-            "speaker": s.get("speaker") or None,
-            "content": txt,
-            "lang": (s.get("lang") or lang or "auto"),
-        })
+        rows.append(
+            {
+                "project_id": project_id,
+                "video_id": video_id,
+                "start": float(s.get("start", 0)),
+                "duration": float(s.get("duration", 0)),
+                "speaker": s.get("speaker") or None,
+                "content": txt,
+                "lang": (s.get("lang") or lang or "auto"),
+            }
+        )
     for i in range(0, len(rows), 500):
-        supabase.table("segments").upsert(rows[i:i + 500], on_conflict="project_id,video_id,start").execute()
+        supabase.table("segments").upsert(rows[i : i + 500], on_conflict="project_id,video_id,start").execute()
 
 # ---------- Quote extraction ----------
+
 QUOTE_MODEL = "gpt-4o-mini"
 MAX_WINDOW_CHARS = 8000
 
@@ -127,9 +147,16 @@ EXTRACTION_SYS = (
 )
 
 def get_video_segments(project_id: str, video_id: str):
-    res = supabase.table("segments").select("start,duration,content,lang")\
-        .eq("project_id", project_id).eq("video_id", video_id).order("start").execute()
+    res = (
+        supabase.table("segments")
+        .select("start,duration,content,lang")
+        .eq("project_id", project_id)
+        .eq("video_id", video_id)
+        .order("start")
+        .execute()
+    )
     return res.data or []
+
 
 def get_project_display_name(project_id: str) -> str:
     try:
@@ -139,6 +166,7 @@ def get_project_display_name(project_id: str) -> str:
     except Exception:
         pass
     return "Kilden"
+
 
 def _windows_from_segments(segments, max_chars=MAX_WINDOW_CHARS):
     cur, cur_chars = [], 0
@@ -154,6 +182,7 @@ def _windows_from_segments(segments, max_chars=MAX_WINDOW_CHARS):
     if cur:
         yield cur
 
+
 def _nearest_timestamp_for_quote(qtext: str, window_segments):
     q = (qtext or "").strip()
     if not q:
@@ -165,59 +194,36 @@ def _nearest_timestamp_for_quote(qtext: str, window_segments):
             return float(seg.get("start") or 0.0)
     return float(window_segments[0].get("start") or 0.0) if window_segments else None
 
-def extract_quotes_from_video(project_id: str, video_id: str, lang_hint: str, source: str = "asr", max_quotes_per_window: int = 6):
+
+def extract_quotes_from_video(
+    project_id: str,
+    video_id: str,
+    lang_hint: str,
+    source: str = "asr",
+    max_quotes_per_window: int = 6,
+) -> tuple[int, int]:
+    """
+    Returnerer (inserted, attempted).
+    - inserted: antal rækker der blev indsat i DB
+    - attempted: antal quotes modellen foreslog i alt
+    """
     segs = get_video_segments(project_id, video_id)
     if not segs:
-        return 0
-    
+        st.caption(f"[{video_id}] No segments found – skipping.")
+        return 0, 0
+
     attribution = get_project_display_name(project_id)
     total_inserted = 0
+    total_attempted = 0
 
-def backfill_quotes_for_project(project_id: str, lang_hint: str) -> tuple[int, int]:
-    """Lav citater for alle videoer i projektet, hvor der ikke findes quotes endnu."""
-    vids = supabase.table("videos").select("id").eq("project_id", project_id).execute().data or []
-    processed, created = 0, 0
-
-    for v in vids:
-        vid = v["id"]
-
-        # Findes der allerede mindst ét quote for denne video?
-        qres = supabase.table("quotes").select("id", count="exact") \
-            .eq("project_id", project_id).eq("video_id", vid).limit(1).execute()
-        has_quotes = bool(getattr(qres, "count", 0))
-
-        if has_quotes:
-            continue
-
-        # Er der segments at arbejde med?
-        sres = supabase.table("segments").select("video_id", count="exact") \
-            .eq("project_id", project_id).eq("video_id", vid).limit(1).execute()
-        has_segments = bool(getattr(sres, "count", 0))
-
-        if not has_segments:
-            continue
-
-        # Uddrag citater ud fra eksisterende segments
-        try:
-            new_cnt = extract_quotes_from_video(project_id, vid, lang_hint, source="backfill")
-            created += int(new_cnt or 0)
-            processed += 1
-        except Exception as e:
-            st.caption(f"Backfill for {vid} skipped: {e}")
-            continue
-
-    return processed, created
-
-    
     for win in _windows_from_segments(segs):
         text = "\n".join((s.get("content") or "").strip() for s in win if s.get("content"))
         if not text.strip():
             continue
 
         user_prompt = (
-            f"Sprog: {lang_hint or 'auto'}.\n"
-            f"Maks {max_quotes_per_window} citater.\n"
-            "Tekst:\n---\n" + text + "\n---\n\n"
+            f"Sprog: {lang_hint or 'auto'}.\nMaks {max_quotes_per_window} citater.\n"
+            "Tekst:\n---\n" + text + "\n---\n"
             "Returnér KUN JSON som beskrevet i systemprompten."
         )
 
@@ -234,14 +240,21 @@ def backfill_quotes_for_project(project_id: str, lang_hint: str) -> tuple[int, i
             js = json.loads(resp.choices[0].message.content or "{}")
             items = js.get("quotes") or []
         except Exception as e:
-            st.caption(f"Quote-extraction LLM error: {e}")
+            st.caption(f"[{video_id}] LLM parse/generation error: {e}")
             continue
+
+        if not items:
+            st.caption(f"[{video_id}] No quotes suggested in this window.")
+            continue
+
+        total_attempted += len(items)
 
         for it in items:
             paraphrase = (it.get("quote") or "").strip()
-            original   = (it.get("original") or "").strip()
+            original = (it.get("original") or "").strip()
             if not paraphrase:
                 continue
+
             start = _nearest_timestamp_for_quote(original or paraphrase, win)
             end = None if start is None else start + 6.0
 
@@ -253,7 +266,7 @@ def backfill_quotes_for_project(project_id: str, lang_hint: str) -> tuple[int, i
                 "quote": paraphrase,
                 "original": original or None,
                 "topic": (it.get("topic") or None),
-                "tags": it.get("tags") or [],
+                "tags": it.get("tags") or [],  # -> jsonb i DB
                 "lang": lang_hint or None,
                 "source": source,
                 "confidence": float(it.get("confidence") or 0.6),
@@ -263,13 +276,57 @@ def backfill_quotes_for_project(project_id: str, lang_hint: str) -> tuple[int, i
             try:
                 supabase.table("quotes").insert(row).execute()
                 total_inserted += 1
-            except Exception:
-                # sandsynligvis duplikat pga. unique index
-                pass
+            except APIError as e:
+                st.warning(f"[{video_id}] INSERT failed: code={getattr(e,'code',None)} msg={getattr(e,'message',e)} row={row}")
+            except Exception as e:
+                st.warning(f"[{video_id}] INSERT failed: {e}")
 
-    return total_inserted
+    return total_inserted, total_attempted
+
+
+def backfill_quotes_for_project(project_id: str, lang_hint: str) -> tuple[int, int]:
+    """Generate quotes for all videos in a project that currently have none."""
+    vids = supabase.table("videos").select("id").eq("project_id", project_id).execute().data or []
+    processed, created = 0, 0
+
+    for v in vids:
+        vid = v["id"]
+
+        qres = (
+            supabase.table("quotes")
+            .select("id", count="exact")
+            .eq("project_id", project_id)
+            .eq("video_id", vid)
+            .limit(1)
+            .execute()
+        )
+        if bool(getattr(qres, "count", 0)):
+            continue
+
+        sres = (
+            supabase.table("segments")
+            .select("video_id", count="exact")
+            .eq("project_id", project_id)
+            .eq("video_id", vid)
+            .limit(1)
+            .execute()
+        )
+        if not bool(getattr(sres, "count", 0)):
+            continue
+
+        try:
+            inserted, attempted = extract_quotes_from_video(project_id, vid, lang_hint, source="backfill")
+            st.caption(f"[{vid}] quotes attempted={attempted}, inserted={inserted}")
+            if attempted > 0:
+                processed += 1
+                created += inserted
+        except Exception as e:
+            st.caption(f"[{vid}] Backfill error: {e}")
+
+    return processed, created
 
 # ---------- HTTP helper ----------
+
 def _http_get(url: str, params: dict, timeout=60):
     with httpx.Client(timeout=timeout) as c:
         r = c.get(url, params=params)
@@ -281,6 +338,7 @@ def _http_get(url: str, params: dict, timeout=60):
         return r.json()
 
 # ---------- YouTube Data API ----------
+
 def _extract_bits(inp: str):
     s = (inp or "").strip()
     if s.startswith("@"):
@@ -299,6 +357,7 @@ def _extract_bits(inp: str):
         return None, None, None, m.group(1)
     return None, None, None, None
 
+
 def _resolve_channel_id(handle_or_url: str) -> str:
     base = "https://www.googleapis.com/youtube/v3"
     handle, ch_id, username, custom = _extract_bits(handle_or_url)
@@ -315,18 +374,22 @@ def _resolve_channel_id(handle_or_url: str) -> str:
         if items:
             return items[0]["id"]
     q = (handle_or_url or "").replace("https://www.youtube.com/", " ").strip()
-    data = _http_get(f"{base}/search", {"part": "snippet", "type": "channel", "q": q or "", "maxResults": 1, "key": YOUTUBE_API_KEY})
+    data = _http_get(
+        f"{base}/search",
+        {"part": "snippet", "type": "channel", "q": q or "", "maxResults": 1, "key": YOUTUBE_API_KEY},
+    )
     items = data.get("items", [])
     if items:
         return items[0]["snippet"]["channelId"]
     raise RuntimeError("Channel not found via YouTube API.")
+
 
 def list_videos_by_channel_id(channel_id: str):
     base = "https://www.googleapis.com/youtube/v3"
     info = _http_get(f"{base}/channels", {"part": "contentDetails", "id": channel_id, "key": YOUTUBE_API_KEY})
     items = info.get("items", [])
     if not items:
-        raise RuntimeError("Channel not found (contentDetails) for provided channelId.")
+        raise RuntimeError("Channel not found (contentDetails).")
     uploads_pl = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
     out, page = [], None
@@ -347,39 +410,50 @@ def list_videos_by_channel_id(channel_id: str):
     return out
 
 # ---------- Captions ----------
+
 def fetch_youtube_captions(video_id: str, preferred=("da", "en", "no", "sv")):
     """Try preferred languages, then manual, then generated, then translate to en."""
     try:
         ts_list = YouTubeTranscriptApi.list_transcripts(video_id)
 
-        # Preferred languages
         for lang in preferred:
             try:
                 tr = ts_list.find_transcript([lang])
-                return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr.fetch()]
+                return [
+                    {"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")}
+                    for s in tr.fetch()
+                ]
             except Exception:
                 pass
 
-        # Manual > generated
         try:
             all_langs = [t.language_code for t in ts_list]
             tr = ts_list.find_manually_created_transcript(all_langs)
-            return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr.fetch()]
-        except Exception:
-            pass
-        try:
-            all_langs = [t.language_code for t in ts_list]
-            tr = ts_list.find_generated_transcript(all_langs)
-            return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr.fetch()]
+            return [
+                {"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")}
+                for s in tr.fetch()
+            ]
         except Exception:
             pass
 
-        # Translate to English last
+        try:
+            all_langs = [t.language_code for t in ts_list]
+            tr = ts_list.find_generated_transcript(all_langs)
+            return [
+                {"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")}
+                for s in tr.fetch()
+            ]
+        except Exception:
+            pass
+
         try:
             for t in ts_list:
                 try:
                     tr_en = t.translate("en")
-                    return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr_en.fetch()]
+                    return [
+                        {"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")}
+                        for s in tr_en.fetch()
+                    ]
                 except Exception:
                     continue
         except Exception:
@@ -391,6 +465,7 @@ def fetch_youtube_captions(video_id: str, preferred=("da", "en", "no", "sv")):
         return None
 
 # ---------- Language helper ----------
+
 def preferred_langs_for(project_lang: str) -> tuple[str, ...]:
     pl = (project_lang or "auto").lower()
     if pl == "da":
@@ -401,7 +476,8 @@ def preferred_langs_for(project_lang: str) -> tuple[str, ...]:
         return ("en", "da", "sv")
     return ("da", "en", "sv")  # auto fallback
 
-# ---------- Downloader ----------
+# ---------- Downloader (yt-dlp) ----------
+
 def _write_cookies_if_any(cookies_text: str) -> str | None:
     if not cookies_text:
         return None
@@ -411,6 +487,7 @@ def _write_cookies_if_any(cookies_text: str) -> str | None:
     if "# Netscape" not in cookies_text:
         st.caption("⚠️ cookies.txt without Netscape header – proceeding anyway.")
     return str(cookiefile)
+
 
 def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merge_to: str = "m4a") -> Path | None:
     ytdl_opts = {
@@ -424,13 +501,14 @@ def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merg
         "geo_bypass": True,
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": merge_to, "preferredquality": "0"}],
         "merge_output_format": merge_to,
-        "concurrent_fragments": 3,
+        "concurrent_fragment_downloads": 3,
         "overwrites": True,
         "force_ipv4": True,
         "extractor_args": {"youtube": {"player_client": ["android", "web", "web_safari"]}},
     }
     if cookiefile:
         ytdl_opts["cookiefile"] = cookiefile
+
     try:
         with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
             ydl.download([url])
@@ -446,13 +524,20 @@ def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merg
     best = max(matches, key=lambda p: p.stat().st_size)
     return best if best.exists() and best.stat().st_size > 0 else None
 
+
 def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
     tmpdir = Path(tempfile.mkdtemp(prefix=f"yqf_{video_id}_"))
     outtmpl = str(tmpdir / f"{video_id}.%(ext)s")
     url = f"https://www.youtube.com/watch?v={video_id}"
     cookiefile = _write_cookies_if_any(cookies_text)
 
-    fmt_list = ["140", "251", "bestaudio[ext=m4a]/bestaudio", "bestaudio/best", "best"]
+    fmt_list = [
+        "140",  # m4a 128kbps
+        "251",  # webm/opus ~160kbps
+        "bestaudio[ext=m4a]/bestaudio",
+        "bestaudio/best",
+        "best",
+    ]
 
     try:
         for fmt in fmt_list:
@@ -470,6 +555,7 @@ def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
         raise
 
 # ---------- OpenAI Whisper (fallback chain) ----------
+
 def transcribe_with_openai(file_path: Path, language: str | None):
     model_candidates = ["gpt-4o-mini-transcribe", "whisper-1"]
     last_err = None
@@ -488,11 +574,13 @@ def transcribe_with_openai(file_path: Path, language: str | None):
                 for s in segments:
                     start = float(s.get("start", 0))
                     end = float(s.get("end", start))
-                    segs.append({
-                        "start": start,
-                        "duration": max(0.0, end - start),
-                        "text": (s.get("text") or "").strip(),
-                    })
+                    segs.append(
+                        {
+                            "start": start,
+                            "duration": max(0.0, end - start),
+                            "text": (s.get("text") or "").strip(),
+                        }
+                    )
             elif getattr(resp, "text", None):
                 segs = [{"start": 0, "duration": 0, "text": resp.text.strip()}]
             return segs
@@ -501,7 +589,11 @@ def transcribe_with_openai(file_path: Path, language: str | None):
             continue
     raise RuntimeError(f"OpenAI transcription failed: {last_err}")
 
-# ---------- Sidebar ----------
+# ---------- UI ----------
+
+st.set_page_config(page_title="YouTube Quote Finder", layout="wide")
+st.title("🎬 YouTube Quote Finder")
+
 with st.sidebar:
     st.header("Settings")
     captions_first = st.toggle("Use captions first", value=True)
@@ -523,7 +615,6 @@ if "pid" not in st.session_state:
 if "resolved_channel_id" not in st.session_state:
     st.session_state.resolved_channel_id = None
 
-# ---------- Tabs ----------
 tab_idx, tab_search = st.tabs(["📦 Index Videos", "💬 Find Quotes"])
 
 def hhmmss(sec: float):
@@ -574,9 +665,8 @@ with tab_idx:
                     vid = v["video_id"]
                     upsert_video(pid, v)
 
-                    # Dedup
                     if is_already_indexed(pid, vid):
-                        st.write(f"⏭️ Skipper allerede indekseret: {v['title']}")
+                        st.write(f"⏭️ Skipping already indexed: {v['title']}")
                         done += 1
                         prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
                         continue
@@ -601,16 +691,17 @@ with tab_idx:
                         if not segs:
                             st.warning(f"No segments for {vid} (captions+ASR failed).")
                         else:
-                            # markér som indekseret
-                            supabase.table("videos").update({
-                                "indexed_at": datetime.now(timezone.utc).isoformat()
-                            }).eq("id", vid).execute()
+                            supabase.table("videos").update(
+                                {"indexed_at": datetime.now(timezone.utc).isoformat()}
+                            ).eq("id", vid).execute()
 
-                            # ➕ citatudtræk
+                            # AI quotes
                             try:
-                                inserted = extract_quotes_from_video(pid, vid, project_lang, source=("captions" if captions_first else "asr"))
-                                if inserted:
-                                    st.write(f"➕ Extracted {inserted} publish-ready quotes")
+                                inserted, attempted = extract_quotes_from_video(
+                                    pid, vid, project_lang, source=("captions" if captions_first else "asr")
+                                )
+                                if attempted:
+                                    st.write(f"➕ Quotes attempted {attempted}, inserted {inserted}")
                             except Exception as e:
                                 st.caption(f"Quote extraction skipped: {e}")
 
@@ -635,28 +726,26 @@ with tab_idx:
             st.dataframe(pd.DataFrame(prjs), use_container_width=True)
         else:
             st.info("No projects yet.")
+
+        st.subheader("Backfill quotes")
+        prjs_bf = prjs or list_projects()
+        if prjs_bf:
+            options_bf = {p["name"]: p["id"] for p in prjs_bf}
+            sel_bf = st.selectbox("Project to backfill", list(options_bf.keys()), key="bf_proj")
+            if st.button("Generate missing quotes for this project", key="bf_btn"):
+                proc, made = backfill_quotes_for_project(options_bf[sel_bf], project_lang)
+                st.success(f"Backfill done: processed {proc} videos, created {made} new quotes.")
+        else:
+            st.info("No projects to backfill yet.")
     except Exception as e:
         st.exception(e)
 
-with tab_idx:
-    st.subheader("Backfill quotes")
-    prjs_bf = list_projects()
-if prjs_bf:
-    options_bf = {p["name"]: p["id"] for p in prjs_bf}
-    sel_bf = st.selectbox("Project to backfill", list(options_bf.keys()), key="bf_proj")
-if st.button("Generate missing quotes for this project", key="bf_btn"):
-     proc, made = backfill_quotes_for_project(options_bf[sel_bf], project_lang)
-     st.success(f"Backfill done: processed {proc} videos, created {made} new quotes.")
-else:
-    st.info("No projects to backfill yet.")
-
-
-# --- Find Quotes tab ---
+# --- Search tab ---
 with tab_search:
-    search_mode = st.radio("Search in:", ["Segments", "Quotes"], horizontal=True)
+    search_mode = st.radio("Search in:", ["Segments", "Quotes"], horizontal=True, key="mode")
 
     try:
-        st.subheader("Search")
+        st.subheader("Find Quotes")
         prjs = list_projects()
         if not prjs:
             st.info("Create a project first.")
@@ -669,147 +758,113 @@ with tab_search:
             rows = []
             if st.button("Search", key="search_btn"):
                 if search_mode == "Segments":
-                    # --- Segment-søgning (RPC + fallback) ---
+                    # RPC with FTS + language, fallback to LIKE
                     try:
-                        res = supabase.rpc("segments_search_by_project", {
-                            "p_limit": int(limit),
-                            "p_project": options[sel],
-                            "p_query": q.strip(),
-                        }).execute()
+                        res = supabase.rpc(
+                            "segments_search_by_project",
+                            {"p_limit": int(limit), "p_project": options[sel], "p_query": q.strip()},
+                        ).execute()
                         rows = res.data or []
                     except APIError as e:
                         st.warning(
                             "RPC failed — falling back to simple LIKE search (no stemming/synonyms).\n"
                             f"code={getattr(e,'code',None)} message={getattr(e,'message',None)}"
                         )
-                        seg_rows = supabase.table("segments")\
-                            .select("content,start,video_id,project_id")\
-                            .eq("project_id", options[sel])\
-                            .ilike("content", f"%{q.strip()}%")\
-                            .limit(int(limit))\
-                            .execute().data or []
-
+                        seg_rows = (
+                            supabase.table("segments")
+                            .select("content,start,video_id,project_id")
+                            .eq("project_id", options[sel])
+                            .ilike("content", f"%{q.strip()}%")
+                            .limit(int(limit))
+                            .execute()
+                            .data
+                            or []
+                        )
                         vid_ids = sorted({r["video_id"] for r in seg_rows})
                         videos_map = {}
                         if vid_ids:
-                            vids = supabase.table("videos")\
-                                .select("id,title,url")\
-                                .in_("id", vid_ids)\
-                                .execute().data or []
+                            vids = (
+                                supabase.table("videos")
+                                .select("id,title,url")
+                                .in_("id", vid_ids)
+                                .execute()
+                                .data
+                                or []
+                            )
                             videos_map = {v["id"]: {"title": v.get("title"), "url": v.get("url")} for v in vids}
-
-                        rows = [{
-                            "title": videos_map.get(r["video_id"], {}).get("title"),
-                            "url": videos_map.get(r["video_id"], {}).get("url"),
-                            "content": r.get("content"),
-                            "start": r.get("start"),
-                        } for r in seg_rows]
-
-                    # visning for segments
-                    if not rows:
-                        st.info("No results.")
-                    else:
-                        df = pd.DataFrame(rows)
-                        if "start" in df:
-                            df["timestamp"] = df["start"].fillna(0).map(hhmmss)
-                        cols = [c for c in ("title", "speaker", "content", "timestamp", "url") if c in df.columns]
-                        if not cols:
-                            cols = [c for c in ("content", "timestamp") if c in df.columns]
-                        df = df[cols].rename(columns={"content": "quote"})
-                        st.dataframe(df, use_container_width=True)
-                        st.download_button(
-                            "Download CSV",
-                            df.to_csv(index=False).encode("utf-8"),
-                            "search_results.csv",
-                            "text/csv",
-                        )
-
+                        rows = [
+                            {
+                                "title": videos_map.get(r["video_id"], {}).get("title"),
+                                "url": videos_map.get(r["video_id"], {}).get("url"),
+                                "content": r.get("content"),
+                                "start": r.get("start"),
+                            }
+                            for r in seg_rows
+                        ]
                 else:
-                    # --- Quote-søgning ---
-                    st.caption("💬 Searching in AI-extracted quotes…")
-                    qb = supabase.table("quotes")\
-                        .select("quote,original,topic,tags,lang,start,video_id,project_id,attribution")\
-                        .eq("project_id", options[sel])\
-                        .order("created_at", desc=True)\
+                    # Quote search (simple client-side filter)
+                    qb = (
+                        supabase.table("quotes")
+                        .select("quote,original,topic,tags,lang,start,video_id,attribution,created_at")
+                        .eq("project_id", options[sel])
+                        .order("created_at", desc=True)
                         .limit(int(limit))
-
+                    )
                     rows = qb.execute().data or []
                     if q.strip():
                         ql = q.lower()
-                        rows = [r for r in rows if
-                                (r.get("quote") and ql in r["quote"].lower()) or
-                                (r.get("original") and ql in (r["original"] or "").lower()) or
-                                (r.get("topic") and ql in (r["topic"] or "").lower()) or
-                                any(ql in (t or "").lower() for t in (r.get("tags") or []))
-                               ][:int(limit)]
+                        rows = [
+                            r
+                            for r in rows
+                            if (r.get("quote") and ql in r["quote"].lower())
+                            or (r.get("original") and ql in (r["original"] or "").lower())
+                            or (r.get("topic") and ql in (r["topic"] or "").lower())
+                            or any(ql in (t or "").lower() for t in (r.get("tags") or []))
+                        ][: int(limit)]
 
                     vid_ids = sorted({r["video_id"] for r in rows})
                     videos_map = {}
                     if vid_ids:
-                        vids = supabase.table("videos").select("id,title,url").in_("id", vid_ids).execute().data or []
+                        vids = (
+                            supabase.table("videos").select("id,title,url").in_("id", vid_ids).execute().data or []
+                        )
                         videos_map = {v["id"]: {"title": v.get("title"), "url": v.get("url")} for v in vids}
 
-                    def ts_link(url, start):
-                        if not url: return None
-                        try:
-                            s = int(round(float(start or 0)))
-                        except Exception:
-                            s = 0
-                        sep = "&" if "?" in url else "?"
-                        return f"{url}{sep}t={s}s"
+                    rows = [
+                        {
+                            "title": videos_map.get(r["video_id"], {}).get("title"),
+                            "url": videos_map.get(r["video_id"], {}).get("url"),
+                            "quote": r.get("quote"),
+                            "original": r.get("original"),
+                            "topic": r.get("topic"),
+                            "tags": ", ".join(r.get("tags") or []),
+                            "lang": r.get("lang"),
+                            "attribution": r.get("attribution"),
+                            "timestamp": hhmmss(r.get("start") or 0),
+                        }
+                        for r in rows
+                    ]
 
-                    df = pd.DataFrame([{
-                        "title": videos_map.get(r["video_id"], {}).get("title"),
-                        "url": ts_link(videos_map.get(r["video_id"], {}).get("url"), r.get("start")),
-                        "quote": r.get("quote"),
-                        "original": r.get("original"),
-                        "attribution": r.get("attribution"),
-                        "topic": r.get("topic"),
-                        "tags": ", ".join(r.get("tags") or []),
-                        "lang": r.get("lang"),
-                    } for r in rows])
-
-                    if df.empty:
-                        st.info("No quotes yet.")
-                    else:
-                        st.dataframe(df, use_container_width=True)
-                        st.download_button(
-                            "Download CSV",
-                            df.to_csv(index=False).encode("utf-8"),
-                            "quotes.csv",
-                            "text/csv",
-                        )
-
+            # Render results
+            if not rows:
+                st.info("No results.")
+            else:
+                df = pd.DataFrame(rows)
+                # normalize columns for segment view
+                if "start" in df and "timestamp" not in df.columns:
+                    df["timestamp"] = df["start"].fillna(0).map(hhmmss)
+                if search_mode == "Segments":
+                    cols = [c for c in ("title", "content", "timestamp", "url") if c in df.columns]
+                    df = df[cols].rename(columns={"content": "quote"})
+                else:
+                    # quotes
+                    pass
+                st.dataframe(df, use_container_width=True)
+                st.download_button(
+                    "Download CSV",
+                    df.to_csv(index=False).encode("utf-8"),
+                    "search_results.csv",
+                    "text/csv",
+                )
     except Exception as e:
         st.exception(e)
-
-# ---------- Diagnostics (optional expander) ----------
-with st.expander("Diagnostics"):
-    def diagnose_video(video_id: str, cookies_text: str = "") -> dict:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        cookiefile = _write_cookies_if_any(cookies_text)
-        opts = {"quiet": True, "skip_download": True, "noplaylist": True,
-                "http_headers": {"User-Agent": "Mozilla/5.0"}, "force_ipv4": True}
-        if cookiefile:
-            opts["cookiefile"] = cookiefile
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-        ps = info.get("playability_status") or {}
-        return {
-            "ok": True,
-            "formats": len(info.get("formats") or []),
-            "age_limit": info.get("age_limit"),
-            "availability": info.get("availability"),
-            "playable_in_embed": info.get("playable_in_embed"),
-            "status": ps.get("status"),
-            "reason": ps.get("reason"),
-            "uploader": info.get("uploader"),
-            "title": info.get("title"),
-        }
-
-    vid = st.text_input("Video ID", value="SDm_sdmz-FU")
-    if st.button("Run diagnostics"):
-        st.json(diagnose_video(vid, ""))
