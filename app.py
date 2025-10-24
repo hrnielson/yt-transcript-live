@@ -758,11 +758,11 @@ with tab_idx:
                 prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
 
 
-                    if is_already_indexed(pid, vid):
-                        st.write(f"⏭️ Skipping already indexed: {v['title']}")
-                        done += 1
-                        prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
-                        continue
+                if is_already_indexed(pid, vid):
+                    st.write(f"⏭️ Skipping already indexed: {v['title']}")
+                    done += 1
+                    prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
+                    continue
 
                     st.write(f"Processing {v['title']}")
                     segs = None
