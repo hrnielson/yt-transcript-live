@@ -1,8 +1,9 @@
 # app.py — YouTube Quote Finder (Cloud, OpenAI-only)
 # Streamlit + Supabase + YouTube Data API v3 + Captions-first + OpenAI Whisper
-# One-file version with: project language, dedup, robust yt-dlp, defensive Supabase, RPC search + rich fallback.
+# One-file version with: project language, dedup, robust yt-dlp, defensive Supabase, RPC search + fallback, quote extraction.
 
 import re
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -16,7 +17,10 @@ import yt_dlp
 from openai import OpenAI
 from supabase import Client, create_client
 from youtube_transcript_api import (NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi)
-import json
+
+# ---------- Streamlit page ----------
+st.set_page_config(page_title="YouTube Quote Finder", layout="wide")
+st.title("🎬 YouTube Quote Finder")
 
 # ---------- Secrets / Clients ----------
 SB_URL = st.secrets["SUPABASE_URL"]
@@ -28,7 +32,6 @@ supabase: Client = create_client(SB_URL, SB_KEY)
 oa_client = OpenAI(api_key=OPENAI_KEY)
 
 # ---------- Supabase helpers ----------
-
 def get_or_create_project(name: str, channel_url: str, lang: str):
     """Create-or-update uden at crashe ved RLS/schema-cache issues."""
     try:
@@ -45,7 +48,6 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
             update["channel_url"] = channel_url
         if "lang" in row and (row.get("lang") or "auto") != (lang or "auto"):
             update["lang"] = lang or "auto"
-
         if update:
             try:
                 supabase.table("projects").update(update).eq("id", pid).execute()
@@ -59,17 +61,14 @@ def get_or_create_project(name: str, channel_url: str, lang: str):
         ins = supabase.table("projects").insert(payload).execute()
         return ins.data[0]["id"]
     except APIError as e:
-        if "lang" in payload:
-            payload.pop("lang", None)
-            ins = supabase.table("projects").insert(payload).execute()
-            return ins.data[0]["id"]
-        raise
-
+        # Stale schema cache: prøv uden lang
+        payload.pop("lang", None)
+        ins = supabase.table("projects").insert(payload).execute()
+        return ins.data[0]["id"]
 
 def list_projects():
     r = supabase.table("projects").select("*").order("name", desc=False).execute()
     return r.data or []
-
 
 def upsert_video(project_id: str, v: dict):
     """Idempotent upsert of a video row by primary key id."""
@@ -82,7 +81,6 @@ def upsert_video(project_id: str, v: dict):
     }
     supabase.table("videos").upsert(row, on_conflict="id").execute()
 
-
 def is_already_indexed(project_id: str, video_id: str) -> bool:
     """True hvis videoen allerede har mindst ét segment for projektet eller videos.indexed_at er sat."""
     r = supabase.table("segments").select("video_id").eq("project_id", project_id).eq("video_id", video_id).limit(1).execute()
@@ -90,7 +88,6 @@ def is_already_indexed(project_id: str, video_id: str) -> bool:
         return True
     r2 = supabase.table("videos").select("indexed_at").eq("id", video_id).limit(1).execute()
     return bool(r2.data and r2.data[0].get("indexed_at"))
-
 
 def insert_segments(project_id: str, video_id: str, segments: list[dict], lang: str | None = None):
     """Batch upsert of segments."""
@@ -114,7 +111,6 @@ def insert_segments(project_id: str, video_id: str, segments: list[dict], lang: 
         supabase.table("segments").upsert(rows[i:i + 500], on_conflict="project_id,video_id,start").execute()
 
 # ---------- Quote extraction ----------
-
 QUOTE_MODEL = "gpt-4o-mini"
 MAX_WINDOW_CHARS = 8000
 
@@ -181,7 +177,14 @@ def extract_quotes_from_video(project_id: str, video_id: str, lang_hint: str, so
         text = "\n".join((s.get("content") or "").strip() for s in win if s.get("content"))
         if not text.strip():
             continue
-        user_prompt = f"Sprog: {lang_hint or 'auto'}.\nTekst:\n{text}\n\nReturnér KUN JSON som beskrevet i systemprompten."
+
+        user_prompt = (
+            f"Sprog: {lang_hint or 'auto'}.\n"
+            f"Maks {max_quotes_per_window} citater.\n"
+            "Tekst:\n---\n" + text + "\n---\n\n"
+            "Returnér KUN JSON som beskrevet i systemprompten."
+        )
+
         try:
             resp = oa_client.chat.completions.create(
                 model=QUOTE_MODEL,
@@ -205,6 +208,7 @@ def extract_quotes_from_video(project_id: str, video_id: str, lang_hint: str, so
                 continue
             start = _nearest_timestamp_for_quote(original or paraphrase, win)
             end = None if start is None else start + 6.0
+
             row = {
                 "project_id": project_id,
                 "video_id": video_id,
@@ -224,30 +228,244 @@ def extract_quotes_from_video(project_id: str, video_id: str, lang_hint: str, so
                 supabase.table("quotes").insert(row).execute()
                 total_inserted += 1
             except Exception:
+                # sandsynligvis duplikat pga. unique index
                 pass
+
     return total_inserted
 
-# ---------- Rest af koden (uændret) ---------- 
-# ... [behold alt fra YouTube API, fetch_youtube_captions, etc. som i dit eksisterende script]
-#  ↓↓↓
+# ---------- HTTP helper ----------
+def _http_get(url: str, params: dict, timeout=60):
+    with httpx.Client(timeout=timeout) as c:
+        r = c.get(url, params=params)
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            safe_params = {k: v for k, v in params.items() if k != "key"}
+            raise RuntimeError(f"HTTP {e.response.status_code} on {url} with params {safe_params}") from e
+        return r.json()
 
-# (indsæt din eksisterende kode herfra ned til indekseringsloopen — uændret)
+# ---------- YouTube Data API ----------
+def _extract_bits(inp: str):
+    s = (inp or "").strip()
+    if s.startswith("@"):
+        return s, None, None, None
+    m = re.search(r"youtube\.com/(channel/([^/?#]+))", s, re.I)
+    if m:
+        return None, m.group(2), None, None
+    m = re.search(r"youtube\.com/@([^/?#]+)", s, re.I)
+    if m:
+        return "@" + m.group(1), None, None, None
+    m = re.search(r"youtube\.com/user/([^/?#]+)", s, re.I)
+    if m:
+        return None, None, m.group(1), None
+    m = re.search(r"youtube\.com/c/([^/?#]+)", s, re.I)
+    if m:
+        return None, None, None, m.group(1)
+    return None, None, None, None
 
-# ---------- INDEXING LOOP TILFØJELSE ----------
-# Efter du har indsat segments og markeret videoen som indekseret, indsæt dette:
+def _resolve_channel_id(handle_or_url: str) -> str:
+    base = "https://www.googleapis.com/youtube/v3"
+    handle, ch_id, username, custom = _extract_bits(handle_or_url)
+    if ch_id:
+        return ch_id
+    if handle:
+        data = _http_get(f"{base}/channels", {"part": "id", "forHandle": handle, "key": YOUTUBE_API_KEY})
+        items = data.get("items", [])
+        if items:
+            return items[0]["id"]
+    if username:
+        data = _http_get(f"{base}/channels", {"part": "id", "forUsername": username, "key": YOUTUBE_API_KEY})
+        items = data.get("items", [])
+        if items:
+            return items[0]["id"]
+    q = (handle_or_url or "").replace("https://www.youtube.com/", " ").strip()
+    data = _http_get(f"{base}/search", {"part": "snippet", "type": "channel", "q": q or "", "maxResults": 1, "key": YOUTUBE_API_KEY})
+    items = data.get("items", [])
+    if items:
+        return items[0]["snippet"]["channelId"]
+    raise RuntimeError("Channel not found via YouTube API.")
+
+def list_videos_by_channel_id(channel_id: str):
+    base = "https://www.googleapis.com/youtube/v3"
+    info = _http_get(f"{base}/channels", {"part": "contentDetails", "id": channel_id, "key": YOUTUBE_API_KEY})
+    items = info.get("items", [])
+    if not items:
+        raise RuntimeError("Channel not found (contentDetails) for provided channelId.")
+    uploads_pl = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+
+    out, page = [], None
+    while True:
+        data = _http_get(
+            f"{base}/playlistItems",
+            {"part": "snippet,contentDetails", "playlistId": uploads_pl, "maxResults": 50, "pageToken": page, "key": YOUTUBE_API_KEY},
+        )
+        for it in data.get("items", []):
+            vid = it["contentDetails"]["videoId"]
+            title = it["snippet"]["title"]
+            published_at = it["contentDetails"].get("videoPublishedAt")
+            url = f"https://www.youtube.com/watch?v={vid}"
+            out.append({"video_id": vid, "title": title, "published_at": published_at, "url": url})
+        page = data.get("nextPageToken")
+        if not page:
+            break
+    return out
+
+# ---------- Captions ----------
+def fetch_youtube_captions(video_id: str, preferred=("da", "en", "no", "sv")):
+    """Try preferred languages, then manual, then generated, then translate to en."""
+    try:
+        ts_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+        # Preferred languages
+        for lang in preferred:
+            try:
+                tr = ts_list.find_transcript([lang])
+                return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr.fetch()]
+            except Exception:
+                pass
+
+        # Manual > generated
+        try:
+            all_langs = [t.language_code for t in ts_list]
+            tr = ts_list.find_manually_created_transcript(all_langs)
+            return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr.fetch()]
+        except Exception:
+            pass
+        try:
+            all_langs = [t.language_code for t in ts_list]
+            tr = ts_list.find_generated_transcript(all_langs)
+            return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr.fetch()]
+        except Exception:
+            pass
+
+        # Translate to English last
+        try:
+            for t in ts_list:
+                try:
+                    tr_en = t.translate("en")
+                    return [{"start": s["start"], "duration": s.get("duration", 0), "text": s.get("text", "")} for s in tr_en.fetch()]
+                except Exception:
+                    continue
+        except Exception:
+            return None
+
+    except (TranscriptsDisabled, NoTranscriptFound):
+        return None
+    except Exception:
+        return None
+
+# ---------- Language helper ----------
+def preferred_langs_for(project_lang: str) -> tuple[str, ...]:
+    pl = (project_lang or "auto").lower()
+    if pl == "da":
+        return ("da", "no", "sv", "en")
+    if pl == "sv":
+        return ("sv", "no", "da", "en")
+    if pl == "en":
+        return ("en", "da", "sv")
+    return ("da", "en", "sv")  # auto fallback
+
+# ---------- Downloader ----------
+def _write_cookies_if_any(cookies_text: str) -> str | None:
+    if not cookies_text:
+        return None
+    tmpdir = Path(tempfile.mkdtemp(prefix="cookies_"))
+    cookiefile = tmpdir / "cookies.txt"
+    cookiefile.write_text(cookies_text, encoding="utf-8")
+    if "# Netscape" not in cookies_text:
+        st.caption("⚠️ cookies.txt without Netscape header – proceeding anyway.")
+    return str(cookiefile)
+
+def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merge_to: str = "m4a") -> Path | None:
+    ytdl_opts = {
+        "format": fmt,
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "retries": 4,
+        "fragment_retries": 4,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
+        "geo_bypass": True,
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": merge_to, "preferredquality": "0"}],
+        "merge_output_format": merge_to,
+        "concurrent_fragments": 3,
+        "overwrites": True,
+        "force_ipv4": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web", "web_safari"]}},
+    }
+    if cookiefile:
+        ytdl_opts["cookiefile"] = cookiefile
+    try:
+        with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        st.caption(f"yt-dlp error ({fmt}): {e}")
+        return None
+
+    outdir = Path(outtmpl).parent
+    stem = Path(outtmpl).name.split(".")[0]
+    matches = list(outdir.glob(f"{stem}.*"))
+    if not matches:
+        return None
+    best = max(matches, key=lambda p: p.stat().st_size)
+    return best if best.exists() and best.stat().st_size > 0 else None
+
+def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
+    tmpdir = Path(tempfile.mkdtemp(prefix=f"yqf_{video_id}_"))
+    outtmpl = str(tmpdir / f"{video_id}.%(ext)s")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cookiefile = _write_cookies_if_any(cookies_text)
+
+    fmt_list = ["140", "251", "bestaudio[ext=m4a]/bestaudio", "bestaudio/best", "best"]
 
     try:
-        inserted = extract_quotes_from_video(pid, vid, project_lang, source=("captions" if captions_first else "asr"))
-        if inserted:
-            st.write(f"➕ Extracted {inserted} publish-ready quotes")
-    except Exception as e:
-        st.caption(f"Quote extraction skipped: {e}")
+        for fmt in fmt_list:
+            p = _try_download(url, outtmpl, fmt, cookiefile)
+            if p:
+                return p
+        raise RuntimeError("No available format could be downloaded (all strategies failed)")
+    except Exception:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            if cookiefile:
+                shutil.rmtree(Path(cookiefile).parent, ignore_errors=True)
+        except Exception:
+            pass
+        raise
 
-# ---------- UI (one tabs block, clean) ----------
+# ---------- OpenAI Whisper (fallback chain) ----------
+def transcribe_with_openai(file_path: Path, language: str | None):
+    model_candidates = ["gpt-4o-mini-transcribe", "whisper-1"]
+    last_err = None
+    for mdl in model_candidates:
+        try:
+            with open(file_path, "rb") as f:
+                resp = oa_client.audio.transcriptions.create(
+                    model=mdl,
+                    file=f,
+                    language=language if language else None,
+                    response_format="verbose_json",
+                )
+            segs = []
+            segments = getattr(resp, "segments", None)
+            if segments:
+                for s in segments:
+                    start = float(s.get("start", 0))
+                    end = float(s.get("end", start))
+                    segs.append({
+                        "start": start,
+                        "duration": max(0.0, end - start),
+                        "text": (s.get("text") or "").strip(),
+                    })
+            elif getattr(resp, "text", None):
+                segs = [{"start": 0, "duration": 0, "text": resp.text.strip()}]
+            return segs
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"OpenAI transcription failed: {last_err}")
 
-st.set_page_config(page_title="YouTube Quote Finder", layout="wide")
-st.title("🎬 YouTube Quote Finder")
-
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Settings")
     captions_first = st.toggle("Use captions first", value=True)
@@ -269,8 +487,8 @@ if "pid" not in st.session_state:
 if "resolved_channel_id" not in st.session_state:
     st.session_state.resolved_channel_id = None
 
-# ✅ Kun ét tabs-kald – og alt indhold i disse tre blokke:
-tab_idx, tab_search, tab_quotes = st.tabs(["📦 Index", "🔎 Search", "💬 Quotes"])
+# ---------- Tabs ----------
+tab_idx, tab_search = st.tabs(["📦 Index Videos", "💬 Find Quotes"])
 
 def hhmmss(sec: float):
     s = int(round(sec or 0))
@@ -384,10 +602,12 @@ with tab_idx:
     except Exception as e:
         st.exception(e)
 
-# --- Search tab ---
+# --- Find Quotes tab ---
 with tab_search:
+    search_mode = st.radio("Search in:", ["Segments", "Quotes"], horizontal=True)
+
     try:
-        st.subheader("Search quotes")
+        st.subheader("Search")
         prjs = list_projects()
         if not prjs:
             st.info("Create a project first.")
@@ -396,123 +616,151 @@ with tab_search:
             sel = st.selectbox("Project", list(options.keys()), key="search_proj")
             q = st.text_input("Search term", value="hammer", key="search_term")
             limit = st.slider("Max results", 10, 500, 50, 10, key="search_limit")
-            if st.button("Search", key="search_btn"):
-                try:
-                    res = supabase.rpc("segments_search_by_project", {
-                        "p_limit": int(limit),
-                        "p_project": options[sel],
-                        "p_query": q.strip(),
-                    }).execute()
-                    rows = res.data or []
-                except APIError as e:
-                    st.warning(
-                        "RPC failed — falling back to simple LIKE search (no stemming/synonyms).\n"
-                        f"code={getattr(e,'code',None)} message={getattr(e,'message',None)}"
-                    )
-                    seg_rows = supabase.table("segments")\
-                        .select("content,start,video_id,project_id")\
-                        .eq("project_id", options[sel])\
-                        .ilike("content", f"%{q.strip()}%")\
-                        .limit(int(limit))\
-                        .execute().data or []
 
-                    vid_ids = sorted({r["video_id"] for r in seg_rows})
+            rows = []
+            if st.button("Search", key="search_btn"):
+                if search_mode == "Segments":
+                    # --- Segment-søgning (RPC + fallback) ---
+                    try:
+                        res = supabase.rpc("segments_search_by_project", {
+                            "p_limit": int(limit),
+                            "p_project": options[sel],
+                            "p_query": q.strip(),
+                        }).execute()
+                        rows = res.data or []
+                    except APIError as e:
+                        st.warning(
+                            "RPC failed — falling back to simple LIKE search (no stemming/synonyms).\n"
+                            f"code={getattr(e,'code',None)} message={getattr(e,'message',None)}"
+                        )
+                        seg_rows = supabase.table("segments")\
+                            .select("content,start,video_id,project_id")\
+                            .eq("project_id", options[sel])\
+                            .ilike("content", f"%{q.strip()}%")\
+                            .limit(int(limit))\
+                            .execute().data or []
+
+                        vid_ids = sorted({r["video_id"] for r in seg_rows})
+                        videos_map = {}
+                        if vid_ids:
+                            vids = supabase.table("videos")\
+                                .select("id,title,url")\
+                                .in_("id", vid_ids)\
+                                .execute().data or []
+                            videos_map = {v["id"]: {"title": v.get("title"), "url": v.get("url")} for v in vids}
+
+                        rows = [{
+                            "title": videos_map.get(r["video_id"], {}).get("title"),
+                            "url": videos_map.get(r["video_id"], {}).get("url"),
+                            "content": r.get("content"),
+                            "start": r.get("start"),
+                        } for r in seg_rows]
+
+                    # visning for segments
+                    if not rows:
+                        st.info("No results.")
+                    else:
+                        df = pd.DataFrame(rows)
+                        if "start" in df:
+                            df["timestamp"] = df["start"].fillna(0).map(hhmmss)
+                        cols = [c for c in ("title", "speaker", "content", "timestamp", "url") if c in df.columns]
+                        if not cols:
+                            cols = [c for c in ("content", "timestamp") if c in df.columns]
+                        df = df[cols].rename(columns={"content": "quote"})
+                        st.dataframe(df, use_container_width=True)
+                        st.download_button(
+                            "Download CSV",
+                            df.to_csv(index=False).encode("utf-8"),
+                            "search_results.csv",
+                            "text/csv",
+                        )
+
+                else:
+                    # --- Quote-søgning ---
+                    st.caption("💬 Searching in AI-extracted quotes…")
+                    qb = supabase.table("quotes")\
+                        .select("quote,original,topic,tags,lang,start,video_id,project_id,attribution")\
+                        .eq("project_id", options[sel])\
+                        .order("created_at", desc=True)\
+                        .limit(int(limit))
+
+                    rows = qb.execute().data or []
+                    if q.strip():
+                        ql = q.lower()
+                        rows = [r for r in rows if
+                                (r.get("quote") and ql in r["quote"].lower()) or
+                                (r.get("original") and ql in (r["original"] or "").lower()) or
+                                (r.get("topic") and ql in (r["topic"] or "").lower()) or
+                                any(ql in (t or "").lower() for t in (r.get("tags") or []))
+                               ][:int(limit)]
+
+                    vid_ids = sorted({r["video_id"] for r in rows})
                     videos_map = {}
                     if vid_ids:
-                        vids = supabase.table("videos")\
-                            .select("id,title,url")\
-                            .in_("id", vid_ids)\
-                            .execute().data or []
+                        vids = supabase.table("videos").select("id,title,url").in_("id", vid_ids).execute().data or []
                         videos_map = {v["id"]: {"title": v.get("title"), "url": v.get("url")} for v in vids}
 
-                    rows = [{
+                    def ts_link(url, start):
+                        if not url: return None
+                        try:
+                            s = int(round(float(start or 0)))
+                        except Exception:
+                            s = 0
+                        sep = "&" if "?" in url else "?"
+                        return f"{url}{sep}t={s}s"
+
+                    df = pd.DataFrame([{
                         "title": videos_map.get(r["video_id"], {}).get("title"),
-                        "url": videos_map.get(r["video_id"], {}).get("url"),
-                        "content": r.get("content"),
-                        "start": r.get("start"),
-                    } for r in seg_rows]
+                        "url": ts_link(videos_map.get(r["video_id"], {}).get("url"), r.get("start")),
+                        "quote": r.get("quote"),
+                        "original": r.get("original"),
+                        "attribution": r.get("attribution"),
+                        "topic": r.get("topic"),
+                        "tags": ", ".join(r.get("tags") or []),
+                        "lang": r.get("lang"),
+                    } for r in rows])
 
-                if not rows:
-                    st.info("No results.")
-                else:
-                    df = pd.DataFrame(rows)
-                    if "start" in df:
-                        df["timestamp"] = df["start"].fillna(0).map(hhmmss)
-                    cols = [c for c in ("title", "speaker", "content", "timestamp", "url") if c in df.columns]
-                    if not cols:
-                        cols = [c for c in ("content", "timestamp") if c in df.columns]
-                    df = df[cols].rename(columns={"content": "quote"})
-                    st.dataframe(df, use_container_width=True)
-                    st.download_button(
-                        "Download CSV",
-                        df.to_csv(index=False).encode("utf-8"),
-                        "search_results.csv",
-                        "text/csv",
-                    )
+                    if df.empty:
+                        st.info("No quotes yet.")
+                    else:
+                        st.dataframe(df, use_container_width=True)
+                        st.download_button(
+                            "Download CSV",
+                            df.to_csv(index=False).encode("utf-8"),
+                            "quotes.csv",
+                            "text/csv",
+                        )
+
     except Exception as e:
         st.exception(e)
 
-# --- Quotes tab ---
-with tab_quotes:
-    try:
-        st.subheader("Quotes")
-        prjs = list_projects()
-        if not prjs:
-            st.info("Create a project first.")
-        else:
-            options = {p["name"]: p["id"] for p in prjs}
-            sel = st.selectbox("Project", list(options.keys()), key="quotes_proj")
-            q = st.text_input("Filter (ILIKE over quote/topic/tags/attribution)", value="", key="quotes_filter")
-            limit = st.slider("Max rows", 10, 500, 100, 10, key="quotes_limit")
+# ---------- Diagnostics (optional expander) ----------
+with st.expander("Diagnostics"):
+    def diagnose_video(video_id: str, cookies_text: str = "") -> dict:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        cookiefile = _write_cookies_if_any(cookies_text)
+        opts = {"quiet": True, "skip_download": True, "noplaylist": True,
+                "http_headers": {"User-Agent": "Mozilla/5.0"}, "force_ipv4": True}
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        ps = info.get("playability_status") or {}
+        return {
+            "ok": True,
+            "formats": len(info.get("formats") or []),
+            "age_limit": info.get("age_limit"),
+            "availability": info.get("availability"),
+            "playable_in_embed": info.get("playable_in_embed"),
+            "status": ps.get("status"),
+            "reason": ps.get("reason"),
+            "uploader": info.get("uploader"),
+            "title": info.get("title"),
+        }
 
-            qb = supabase.table("quotes")\
-                .select("quote,original,topic,tags,lang,start,video_id,project_id,attribution,paraphrased")\
-                .eq("project_id", options[sel])\
-                .order("created_at", desc=True)\
-                .limit(int(limit))
-
-            rows = qb.execute().data or []
-            if q.strip():
-                ql = q.lower()
-                rows = [r for r in rows if
-                        (r.get("quote") and ql in r["quote"].lower()) or
-                        (r.get("topic") and ql in (r["topic"] or "").lower()) or
-                        (r.get("attribution") and ql in (r["attribution"] or "").lower()) or
-                        any(ql in (t or "").lower() for t in (r.get("tags") or []))
-                       ][:int(limit)]
-
-            vid_ids = sorted({r["video_id"] for r in rows})
-            videos_map = {}
-            if vid_ids:
-                vids = supabase.table("videos").select("id,title,url").in_("id", vid_ids).execute().data or []
-                videos_map = {v["id"]: {"title": v.get("title"), "url": v.get("url")} for v in vids}
-
-            if not rows:
-                st.info("No quotes yet.")
-            else:
-                def ts_link(url, start):
-                    if not url: return None
-                    try:
-                        s = int(round(float(start or 0)))
-                    except Exception:
-                        s = 0
-                    sep = "&" if "?" in url else "?"
-                    return f"{url}{sep}t={s}s"
-
-                df = pd.DataFrame([{
-                    "title": videos_map.get(r["video_id"], {}).get("title"),
-                    "url": ts_link(videos_map.get(r["video_id"], {}).get("url"), r.get("start")),
-                    "quote": r.get("quote"),
-                    "original": r.get("original"),
-                    "attribution": r.get("attribution"),
-                    "topic": r.get("topic"),
-                    "tags": ", ".join(r.get("tags") or []),
-                    "lang": r.get("lang"),
-                } for r in rows])
-
-                st.dataframe(df, use_container_width=True)
-                st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), "quotes.csv", "text/csv")
-    except Exception as e:
-        st.exception(e)
-
-# (Hvis du vil beholde Diagnostics, put evt. i en st.expander nederst i en af tabbene)
+    vid = st.text_input("Video ID", value="SDm_sdmz-FU")
+    if st.button("Run diagnostics"):
+        st.json(diagnose_video(vid, ""))
