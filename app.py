@@ -754,55 +754,54 @@ with tab_idx:
         project_name = st.text_input("Project name", placeholder="Client A", key="proj_name")
         channel_url = st.text_input("Channel handle or URL", placeholder="@brand or https://www.youtube.com/@brand", key="chan_url")
 
-        if st.button("Start indexing", type="primary", disabled=not (project_name and channel_url), key="start_idx"):
-            pid = get_or_create_project(project_name, channel_url, project_lang)
-            st.session_state.pid = pid
-            st.info("Fetching video list via YouTube Data API…")
+if st.button("Start indexing", type="primary", disabled=not (project_name and channel_url), key="start_idx"):
+    pid = get_or_create_project(project_name, channel_url, project_lang)
+    st.session_state.pid = pid
+    st.info("Fetching video list via YouTube Data API…")
 
-            try:
-                chan_id = (channel_id_override or "").strip()
-                if chan_id:
-                    st.success(f"Using provided Channel ID: {chan_id}")
-                    videos = list_videos_by_channel_id(chan_id)
-                    st.session_state.resolved_channel_id = chan_id
-                else:
-                    cid = _resolve_channel_id(channel_url)
-                    st.info(f"Resolved Channel ID: {cid}")
-                    videos = list_videos_by_channel_id(cid)
-                    st.session_state.resolved_channel_id = cid
-            except Exception as e:
-                st.error(f"Could not list videos: {e}")
-                videos = []
+    try:
+        chan_id = (channel_id_override or "").strip()
+        if chan_id:
+            st.success(f"Using provided Channel ID: {chan_id}")
+            videos = list_videos_by_channel_id(chan_id)
+            st.session_state.resolved_channel_id = chan_id
+        else:
+            cid = _resolve_channel_id(channel_url)
+            st.info(f"Resolved Channel ID: {cid}")
+            videos = list_videos_by_channel_id(cid)
+            st.session_state.resolved_channel_id = cid
+    except Exception as e:
+        st.error(f"Could not list videos: {e}")
+        videos = []
 
-            if max_videos > 0:
-                videos = videos[: max_videos]
+    if max_videos > 0:
+        videos = videos[: max_videos]
 
-            if not videos:
-                st.error("No videos found. Check Channel ID, handle, or visibility.")
-            else:
-                st.success(f"Found {len(videos)} videos.")
-                prog = st.progress(0, text="Indexing…")
-                total = len(videos)
-                done = 0
+    if not videos:
+        st.error("No videos found. Check Channel ID, handle, or visibility.")
+    else:
+        st.success(f"Found {len(videos)} videos.")
+        prog = st.progress(0, text="Indexing…")
+        total = len(videos)
+        done = 0
 
-# Én samlet statusboks for hele batchen
-ui = BatchUI(total=len(videos))
+        # ✅ Her starter batchen
+        ui = BatchUI(total=len(videos))
 
-for v in videos:
-    index_one_video_batch(
-        ui=ui,
-        pid=pid,
-        v=v,
-        captions_first=captions_first,
-        project_lang=project_lang,
-        cookies_text=cookies_text,
-    )
-    # opdater også den klassiske progressbar, hvis du vil beholde den
-    done += 1
-    prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
+        for v in videos:
+            index_one_video_batch(
+                ui=ui,
+                pid=pid,
+                v=v,
+                captions_first=captions_first,
+                project_lang=project_lang,
+                cookies_text=cookies_text,
+            )
+            done += 1
+            prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
 
-# Slutbesked
-ui.finish()
+        ui.finish()
+
 
 
         st.divider()
