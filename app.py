@@ -759,60 +759,6 @@ with tab_idx:
                 prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
 
 
-                if is_already_indexed(pid, vid):
-                    st.write(f"⏭️ Skipping already indexed: {v['title']}")
-                    done += 1
-                    prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
-                    continue
-
-                    st.write(f"Processing {v['title']}")
-                    segs = None
-                    audio_path = None
-                    try:
-                        # 1) Captions-first
-                        if captions_first:
-                            segs = fetch_youtube_captions(vid, preferred=preferred_langs_for(project_lang))
-                            if segs:
-                                insert_segments(pid, vid, segs, lang=project_lang)
-
-                        # 2) Audio download + ASR
-                        if not segs:
-                            audio_path = download_audio_tmp(vid, cookies_text)
-                            forced_lang = None if project_lang == "auto" else project_lang
-                            segs = transcribe_with_openai(audio_path, forced_lang)
-                            insert_segments(pid, vid, segs, lang=project_lang)
-
-                        if not segs:
-                            st.warning(f"No segments for {vid} (captions+ASR failed).")
-                        else:
-                            supabase.table("videos").update(
-                                {"indexed_at": datetime.now(timezone.utc).isoformat()}
-                            ).eq("id", vid).execute()
-
-                            # AI quotes
-                            try:
-                                inserted, attempted = extract_quotes_from_video(
-                                    pid, vid, project_lang, source=("captions" if captions_first else "asr")
-                                )
-                                if attempted:
-                                    st.write(f"➕ Quotes attempted {attempted}, inserted {inserted}")
-                            except Exception as e:
-                                st.caption(f"Quote extraction skipped: {e}")
-
-                    except Exception as e:
-                        st.warning(f"Skipped {vid}: {e}")
-                    finally:
-                        try:
-                            if audio_path and isinstance(audio_path, Path):
-                                shutil.rmtree(audio_path.parent, ignore_errors=True)
-                        except Exception:
-                            pass
-
-                    done += 1
-                    prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
-
-                st.success("✅ Done indexing.")
-
         st.divider()
         st.subheader("Existing projects")
         prjs = list_projects()
