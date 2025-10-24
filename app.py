@@ -559,7 +559,7 @@ def download_audio_tmp(video_id: str, cookies_text: str = "", on_event=None) -> 
         for fmt in fmt_list:
             if on_event:
                 on_event(f"⤵️ Forsøger download i format: {fmt}")
-            p = _try_download(url, outtmpl, fmt, cookiefile)
+            p = _try_download(url, outtmpl, fmt, cookiefile, on_event=on_event)
             if p:
                 if on_event:
                     on_event(f"✅ Download OK ({p.suffix.lstrip('.')}, {p.stat().st_size // 1024} KB)")
@@ -653,25 +653,37 @@ import time
 
 class BatchUI:
     def __init__(self, total: int):
-        self.total = total
+        self.total = max(1, total)
         self.done = 0
-        self.stage_ph = st.empty()     # stor statuslinje (hvad sker der nu)
-        self.sub_ph = st.empty()       # evt. undertekst
-        self.progress = st.progress(0) # samlet fremdrift
+        # Overordnet status + progress
+        self.stage_ph = st.empty()           # Hovedstatus ("Analyzing …")
+        self.sub_ph = st.empty()             # Undertekst (detalje)
+        self.progress = st.progress(0)       # ÉN samlet progressbar
+        # Fold-ud log
         self._lines = []
-        self.details = st.expander("Indexing details", expanded=False)  # fold-ud log
+        self.details = st.expander("Indexing details", expanded=False)
         self.log_box = self.details.empty()
+        # Første status
+        self._render_stage("Ready")
+
+    def _render_stage(self, text: str):
+        self.stage_ph.info(f"{text}  •  {self.done}/{self.total}")
 
     def set_stage(self, text: str):
-        self.stage_ph.info(text)
+        self._render_stage(text)
 
     def set_sub(self, text: str):
-        self.sub_ph.write(text)
+        if text:
+            self.sub_ph.write(text)
+        else:
+            self.sub_ph.empty()
 
     def advance(self):
         self.done += 1
-        pct = int(self.done / max(1, self.total) * 100)
+        pct = int(self.done / self.total * 100)
         self.progress.progress(pct)
+        # opdatér tæller i stage-teksten
+        self._render_stage("Indexing")
 
     def log(self, text: str, icon="ℹ️"):
         self._lines.append(f"{icon} {text}")
@@ -682,8 +694,10 @@ class BatchUI:
     def fail(self, text: str): self.log(text, "❌")
 
     def finish(self, success: bool = True):
+        self.set_sub("")
         msg = "✅ Indexing finished" if success else "❌ Indexing finished with errors"
-        self.stage_ph.success(msg)
+        self.stage_ph.success(f"{msg}  •  {self.done}/{self.total}")
+
 
 def index_one_video_batch(
     ui: BatchUI,
@@ -698,6 +712,7 @@ def index_one_video_batch(
     vid = v["video_id"]
 
     ui.set_stage(f"Preparing: {title}")
+    ui.set_sub("")
     ui.log(f"Video ID: {vid}")
 
     # Dedup
@@ -713,7 +728,9 @@ def index_one_video_batch(
         # 1) Captions-first
         if captions_first:
             ui.set_stage("Checking captions")
+            ui.set_sub("Looking for preferred languages…")
             segs = fetch_youtube_captions(vid, preferred=preferred_langs_for(project_lang))
+            ui.set_sub("")
             if segs:
                 insert_segments(pid, vid, segs, lang=project_lang)
                 ui.ok(f"Inserted {len(segs)} caption segments")
@@ -726,10 +743,11 @@ def index_one_video_batch(
             ui.set_sub("Trying m4a/opus and bestaudio fallbacks")
             ui.log("Starting yt-dlp…")
 
-            audio_path = download_audio_tmp(vid, cookies_text)
+            audio_path = download_audio_tmp(vid, cookies_text, on_event=ui.log)
             ui.ok(f"Downloading sound: {audio_path.name}")
 
             ui.set_stage("Transcribing sound")
+            ui.set_sub("")
             forced_lang = None if project_lang == "auto" else project_lang
             segs = transcribe_with_openai(audio_path, forced_lang)
             insert_segments(pid, vid, segs, lang=project_lang)
@@ -744,13 +762,15 @@ def index_one_video_batch(
             }).eq("id", vid).execute()
 
             ui.set_stage("Analyzing transcript")
-            created = extract_quotes_from_video(
+            ui.set_sub("Extracting publish-ready quotes")
+            inserted, attempted = extract_quotes_from_video(
                 project_id=pid,
                 video_id=vid,
                 lang_hint=project_lang,
                 source=("captions" if captions_first else "asr"),
             )
-            ui.ok(f"Generating quotes: {created} new quotes")
+            ui.set_sub("")
+            ui.ok(f"Generating quotes: attempted {attempted}, inserted {inserted}")
 
     except Exception as e:
         ui.fail(f"{title}: {e}")
@@ -795,28 +815,23 @@ with tab_idx:
 
             if not videos:
                 st.error("No videos found. Check Channel ID, handle, or visibility.")
-            else:
-                st.success(f"Found {len(videos)} videos.")
-                prog = st.progress(0, text="Indexing…")
-                total = len(videos)
-                done = 0
+    else:
+        st.success(f"Found {len(videos)} videos.")
 
-                # ✅ Ny statusboks
-                ui = BatchUI(total=len(videos))
+        # ✅ Kun BatchUI håndterer progress nu
+        ui = BatchUI(total=len(videos))
 
-                for v in videos:
-                    index_one_video_batch(
-                        ui=ui,
-                        pid=pid,
-                        v=v,
-                        captions_first=captions_first,
-                        project_lang=project_lang,
-                        cookies_text=cookies_text,
-                    )
-                    done += 1
-                    prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
+        for v in videos:
+            index_one_video_batch(
+                ui=ui,
+                pid=pid,
+                v=v,
+                captions_first=captions_first,
+                project_lang=project_lang,
+                cookies_text=cookies_text,
+            )
 
-                ui.finish()
+        ui.finish()
 
         st.divider()
         st.subheader("Existing projects")
