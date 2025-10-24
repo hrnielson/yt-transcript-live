@@ -489,7 +489,11 @@ def _write_cookies_if_any(cookies_text: str) -> str | None:
     return str(cookiefile)
 
 
-def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merge_to: str = "m4a") -> Path | None:
+def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merge_to: str = "m4a", on_event=None) -> Path | None:
+    """Attempt a single yt-dlp download with FFmpeg postprocessing to a consistent container."""
+    if on_event:
+        on_event(f"Trying format: {fmt}")
+
     ytdl_opts = {
         "format": fmt,
         "outtmpl": outtmpl,
@@ -501,7 +505,7 @@ def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merg
         "geo_bypass": True,
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": merge_to, "preferredquality": "0"}],
         "merge_output_format": merge_to,
-        "concurrent_fragment_downloads": 3,
+        "concurrent_fragments": 3,
         "overwrites": True,
         "force_ipv4": True,
         "extractor_args": {"youtube": {"player_client": ["android", "web", "web_safari"]}},
@@ -513,39 +517,53 @@ def _try_download(url: str, outtmpl: str, fmt: str, cookiefile: str | None, merg
         with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
             ydl.download([url])
     except Exception as e:
-        st.caption(f"yt-dlp error ({fmt}): {e}")
+        msg = f"yt-dlp error ({fmt}): {e}"
+        if on_event:
+            on_event(msg)
+        else:
+            st.caption(msg)
         return None
 
     outdir = Path(outtmpl).parent
     stem = Path(outtmpl).name.split(".")[0]
     matches = list(outdir.glob(f"{stem}.*"))
     if not matches:
+        if on_event:
+            on_event("No output file produced.")
         return None
     best = max(matches, key=lambda p: p.stat().st_size)
+    if on_event:
+        on_event(f"Downloaded file: {best.name} ({best.stat().st_size} bytes)")
     return best if best.exists() and best.stat().st_size > 0 else None
 
 
-def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
+def download_audio_tmp(video_id: str, cookies_text: str = "", on_event=None) -> Path:
+    """Download audio to a temp directory with robust format fallbacks; returns an audio file (m4a) or raises."""
     tmpdir = Path(tempfile.mkdtemp(prefix=f"yqf_{video_id}_"))
     outtmpl = str(tmpdir / f"{video_id}.%(ext)s")
     url = f"https://www.youtube.com/watch?v={video_id}"
     cookiefile = _write_cookies_if_any(cookies_text)
 
     fmt_list = [
-        "140",  # m4a 128kbps
-        "251",  # webm/opus ~160kbps
+        "140",                         # m4a 128kbps
+        "251",                         # webm/opus ~160kbps
         "bestaudio[ext=m4a]/bestaudio",
         "bestaudio/best",
         "best",
     ]
 
     try:
+        if on_event:
+            on_event("Analyzing possible download formats …")
         for fmt in fmt_list:
-            p = _try_download(url, outtmpl, fmt, cookiefile)
+            p = _try_download(url, outtmpl, fmt, cookiefile, on_event=on_event)
             if p:
                 return p
         raise RuntimeError("No available format could be downloaded (all strategies failed)")
-    except Exception:
+    except Exception as e:
+        if on_event:
+            on_event(f"Download failed: {e}")
+        # Cleanup temp dirs if we fail entirely
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
             if cookiefile:
@@ -553,6 +571,7 @@ def download_audio_tmp(video_id: str, cookies_text: str = "") -> Path:
         except Exception:
             pass
         raise
+
 
 # ---------- OpenAI Whisper (fallback chain) ----------
 
@@ -624,6 +643,72 @@ def hhmmss(sec: float):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 # --- Index tab ---
+def index_one_video_with_progress(pid: str, v: dict, captions_first: bool, project_lang: str, cookies_text: str):
+    """Index a single video with a visible step-by-step status panel. Returns (ok: bool, created_quotes: int)."""
+    vid = v["video_id"]
+    title = v.get("title") or vid
+    created_quotes = 0
+    segs = None
+    audio_path = None
+
+    with st.status(f"🔎 Processing: {title}", expanded=True) as status:
+        try:
+            # Dedup
+            if is_already_indexed(pid, vid):
+                status.update(label=f"⏭️ Skipping (already indexed): {title}", state="complete")
+                return True, 0
+
+            # 1) Captions-first
+            if captions_first:
+                status.write("📝 Fetching captions (preferred languages)…")
+                segs = fetch_youtube_captions(vid, preferred=preferred_langs_for(project_lang))
+                if segs:
+                    status.write(f"✅ Captions found: {len(segs)} segments")
+                    insert_segments(pid, vid, segs, lang=project_lang)
+                else:
+                    status.write("ℹ️ No captions found in preferred languages.")
+
+            # 2) Download + ASR
+            if not segs:
+                status.write("⤵️ Downloading audio (yt-dlp fallbacks)…")
+                audio_path = download_audio_tmp(vid, cookies_text, on_event=status.write)
+                status.write("🗣️ Transcribing audio (OpenAI)…")
+                forced_lang = None if project_lang == "auto" else project_lang
+                segs = transcribe_with_openai(audio_path, forced_lang)
+                status.write(f"✅ Transcription done: {len(segs)} segments")
+                insert_segments(pid, vid, segs, lang=project_lang)
+
+            if not segs:
+                status.update(label=f"❌ No segments available: {title}", state="error")
+                return False, 0
+
+            # 3) Mark indexed
+            status.write("🧾 Marking video as indexed …")
+            supabase.table("videos").update({
+                "indexed_at": datetime.now(timezone.utc).isoformat()
+            }).eq("id", vid).execute()
+
+            # 4) Generate quotes
+            status.write("💡 Analyzing transcript & generating publish-ready quotes …")
+            created_quotes = extract_quotes_from_video(pid, vid, project_lang, source=("captions" if captions_first else "asr"))
+            status.write(f"🧩 Quotes created: {created_quotes}")
+
+            status.update(label=f"✅ Finished: {title}", state="complete")
+            return True, created_quotes
+
+        except Exception as e:
+            status.update(label=f"❌ Failed: {title}", state="error")
+            status.write(f"Reason: {e}")
+            return False, 0
+
+        finally:
+            try:
+                if audio_path and isinstance(audio_path, Path):
+                    shutil.rmtree(audio_path.parent, ignore_errors=True)
+            except Exception:
+                pass
+
+
 with tab_idx:
     try:
         st.subheader("Create or update a project")
@@ -661,9 +746,17 @@ with tab_idx:
                 total = len(videos)
                 done = 0
 
-                for v in videos:
-                    vid = v["video_id"]
-                    upsert_video(pid, v)
+            for v in videos:
+                ok, new_quotes = index_one_video_with_progress(
+                    pid=pid,
+                    v=v,
+                    captions_first=captions_first,
+                    project_lang=project_lang,
+                    cookies_text=cookies_text,
+                )
+                done += 1
+                prog.progress(int(done / total * 100), text=f"Indexing… {done}/{total}")
+
 
                     if is_already_indexed(pid, vid):
                         st.write(f"⏭️ Skipping already indexed: {v['title']}")
