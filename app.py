@@ -639,16 +639,16 @@ with tab_idx:
         st.exception(e)
 
 with tab_idx:
-    # ... dit eksisterende UI ...
-    st.subheader("Backfill quotes")
-    prjs = list_projects()
-    if prjs:
-        options_bf = {p["name"]: p["id"] for p in prjs}
-        sel_bf = st.selectbox("Project to backfill", list(options_bf.keys()), key="bf_proj")
-        if st.button("Generate missing quotes for this project", key="bf_btn"):
-            proc, made = backfill_quotes_for_project(options_bf[sel_bf], project_lang)
-            st.success(f"Backfill done: processed {proc} videos, created {made} new quotes.")
-    # ...
+st.subheader("Backfill quotes")
+prjs_bf = list_projects()
+if prjs_bf:
+    options_bf = {p["name"]: p["id"] for p in prjs_bf}
+    sel_bf = st.selectbox("Project to backfill", list(options_bf.keys()), key="bf_proj")
+    if st.button("Generate missing quotes for this project", key="bf_btn"):
+        proc, made = backfill_quotes_for_project(options_bf[sel_bf], project_lang)
+        st.success(f"Backfill done: processed {proc} videos, created {made} new quotes.")
+else:
+    st.info("No projects to backfill yet.")
 
 
 # --- Find Quotes tab ---
