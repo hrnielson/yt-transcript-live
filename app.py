@@ -169,10 +169,40 @@ def extract_quotes_from_video(project_id: str, video_id: str, lang_hint: str, so
     segs = get_video_segments(project_id, video_id)
     if not segs:
         return 0
-
+    
     attribution = get_project_display_name(project_id)
     total_inserted = 0
 
+    def backfill_quotes_for_project(project_id: str, lang_hint: str):
+    """Lav citater for alle videoer i projektet, hvor der ikke findes quotes endnu."""
+    # Hent alle video-ids i projektet
+    vids = supabase.table("videos").select("id").eq("project_id", project_id).execute().data or []
+    processed, created = 0, 0
+    for v in vids:
+        vid = v["id"]
+        # Findes der allerede mindst ét quote for denne video?
+        existing = supabase.table("quotes").select("id", count="exact")\
+                    .eq("project_id", project_id).eq("video_id", vid).limit(1).execute()
+        has_quotes = bool(getattr(existing, "count", 0))
+        if has_quotes:
+            continue
+
+        # Er der segments at arbejde med?
+        segs_exist = supabase.table("segments").select("video_id", count="exact")\
+                        .eq("project_id", project_id).eq("video_id", vid).limit(1).execute()
+        if not bool(getattr(segs_exist, "count", 0)):
+            continue
+
+        # Uddrag citater ud fra segments
+        try:
+            new_cnt = extract_quotes_from_video(project_id, vid, lang_hint, source="backfill")
+            created += int(new_cnt or 0)
+            processed += 1
+        except Exception as e:
+            st.caption(f"Backfill for {vid} skipped: {e}")
+    return processed, created
+
+    
     for win in _windows_from_segments(segs):
         text = "\n".join((s.get("content") or "").strip() for s in win if s.get("content"))
         if not text.strip():
@@ -601,6 +631,19 @@ with tab_idx:
             st.info("No projects yet.")
     except Exception as e:
         st.exception(e)
+
+with tab_idx:
+    # ... dit eksisterende UI ...
+    st.subheader("Backfill quotes")
+    prjs = list_projects()
+    if prjs:
+        options_bf = {p["name"]: p["id"] for p in prjs}
+        sel_bf = st.selectbox("Project to backfill", list(options_bf.keys()), key="bf_proj")
+        if st.button("Generate missing quotes for this project", key="bf_btn"):
+            proc, made = backfill_quotes_for_project(options_bf[sel_bf], project_lang)
+            st.success(f"Backfill done: processed {proc} videos, created {made} new quotes.")
+    # ...
+
 
 # --- Find Quotes tab ---
 with tab_search:
